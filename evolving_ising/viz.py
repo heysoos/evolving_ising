@@ -112,7 +112,7 @@ def plot_fitness_curve(best_hist: List[float], best_so_far: List[float], title: 
     -------
     str  base64-encoded PNG
     """
-    fig, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = plt.subplots(figsize=(6, 3.5))
     iters = np.arange(1, len(best_hist) + 1)
     ax.plot(iters, best_so_far, linewidth=1.5, label="best so far")
     ax.plot(iters, best_hist,   linewidth=0.8, alpha=0.5, label="best (iter)")
@@ -218,7 +218,7 @@ def plot_temp_and_spins(
     -------
     str  base64-encoded PNG
     """
-    fig, axs = plt.subplots(1, 2, figsize=(7, 3.5))
+    fig, axs = plt.subplots(1, 2, figsize=(6, 3.5))
 
     im = axs[0].imshow(T_final.reshape(H, W), cmap="magma", vmin=cold_t, vmax=hot_t)
     axs[0].set_title("Temperature")
@@ -297,8 +297,8 @@ def plot_connectivity(
     J_learned = np.abs(J_nk[mask])
 
     # ── Layout: 2 rows (maps | histogram) ────────────────────────────────────
-    fig = plt.figure(figsize=(10, 6))
-    gs  = fig.add_gridspec(2, 3, height_ratios=[1.2, 0.9], hspace=0.4, wspace=0.3)
+    fig = plt.figure(figsize=(11, 5))
+    gs  = fig.add_gridspec(2, 3, height_ratios=[1.1, 0.85], hspace=0.4, wspace=0.3)
 
     ax_in  = fig.add_subplot(gs[0, 0])
     ax_out = fig.add_subplot(gs[0, 1])
@@ -317,7 +317,7 @@ def plot_connectivity(
     ax_rgb.set_title("R=in,  G=out")
     ax_rgb.axis("off")
 
-    bins = np.linspace(0.0, max(np.max(J_learned), np.max(J_ref)) * 1.05, 60)
+    bins = np.linspace(0.0, max(np.max(J_learned), np.max(J_ref)) * 1.05, 100)
     ax_hist.hist(J_ref,     bins=bins, alpha=0.5, color="steelblue",
                  label=f"Initial reference  (softplus(N(0,{sigma_ref}))·{j_scale})")
     ax_hist.hist(J_learned, bins=bins, alpha=0.5, color="tomato",
@@ -350,7 +350,8 @@ def plot_comparison(
     str  base64-encoded PNG
     """
     n = len(all_T_finals)
-    fig, axs = plt.subplots(1, n, figsize=(4 * n, 4))
+    per_w = max(1.5, min(2.5, 12.0 / max(n, 1)))
+    fig, axs = plt.subplots(1, n, figsize=(per_w * n, 3.5))
     if n == 1:
         axs = [axs]
     for ax, (name, T_final) in zip(axs, all_T_finals.items()):
@@ -405,9 +406,9 @@ def make_rollout_animation(
     ]
 
     fig, ax = plt.subplots(figsize=(4, 4))
-    fig.subplots_adjust(left=0, right=1, top=0.92, bottom=0)
+    # Fill figure completely so the square axes matches the square frame exactly
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     im = ax.imshow(frames_rgb[0], vmin=0.0, vmax=1.0)
-    ax.set_title("Temperature (hue)  ·  Spin (brightness)", fontsize=8, pad=4)
     ax.axis("off")
 
     def _update(i):
@@ -421,8 +422,7 @@ def make_rollout_animation(
     tmp = tempfile.NamedTemporaryFile(suffix=".gif", delete=False)
     tmp.close()
     try:
-        ani.save(tmp.name, writer="pillow", fps=fps,
-                 savefig_kwargs={"dpi": 72})
+        ani.save(tmp.name, writer="pillow", fps=fps, dpi=72)
         with open(tmp.name, "rb") as f:
             gif_bytes = f.read()
     finally:
@@ -492,16 +492,17 @@ def generate_report(
             if gif_b64:
                 anim_html = f"""
             <div class="wide-panel">
-                <div class="panel-label">Animation — temperature (hue) &amp; spins (brightness)</div>
+                <div class="panel-label">Dynamics rollout — combined temperature &amp; spin animation</div>
                 <div class="anim-wrap">
                     <img src="data:image/gif;base64,{gif_b64}" alt="Animation" class="anim-img">
-                    <div class="anim-legend">
-                        <span class="cold">■ cold</span>
-                        <span class="hot">■ hot</span>
-                        &nbsp;|&nbsp;
-                        <span class="sp-up">bright = spin +1</span>
-                        &nbsp;·&nbsp;
-                        <span class="sp-dn">dark = spin −1</span>
+                    <div class="anim-meta">
+                        <div class="anim-title">Encoding</div>
+                        <div class="anim-legend">
+                            <span class="cold">■</span> blue hue → cold temperature<br>
+                            <span class="hot">■</span> red hue → hot temperature<br>
+                            <span class="sp-up">bright</span> → spin +1<br>
+                            <span class="sp-dn">dark</span> → spin −1
+                        </div>
                     </div>
                 </div>
             </div>"""
@@ -558,17 +559,22 @@ def generate_report(
     .metrics {{ display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1rem;
                 font-size: 0.9rem; color: #8b949e; }}
     .metrics strong {{ color: #c9d1d9; }}
-    /* Row 1: fitness (wider) + temp/spins (square panels in one image) */
-    .grid-top {{ display: grid; grid-template-columns: 1.4fr 1fr; gap: 0.5rem; margin-bottom: 0.5rem; }}
-    .grid-top img {{ width: 100%; border-radius: 4px; }}
-    /* Full-width panel below (connectivity, animation) */
-    .wide-panel {{ margin-top: 0.5rem; }}
-    .wide-panel img {{ width: 100%; border-radius: 4px; }}
-    .panel-label {{ font-size: 0.78rem; color: #8b949e; margin-bottom: 0.25rem; }}
-    /* Animation layout */
-    .anim-wrap {{ display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; }}
-    .anim-img {{ border-radius: 4px; max-height: 320px; width: auto; }}
-    .anim-legend {{ font-size: 0.78rem; color: #8b949e; }}
+    /* Row 1: two equal columns — fitness and temp+spins share the same figsize
+       so they render at identical height when displayed at equal widths. */
+    .grid-top {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem;
+                 margin-bottom: 0.6rem; align-items: start; }}
+    .grid-top img {{ width: 100%; display: block; border-radius: 4px; }}
+    /* Full-width panels (connectivity, comparison, animation) */
+    .wide-panel {{ margin-top: 0.6rem; }}
+    .wide-panel > img {{ width: 100%; display: block; border-radius: 4px; }}
+    .panel-label {{ font-size: 0.78rem; color: #8b949e; margin-bottom: 0.3rem;
+                    font-style: italic; }}
+    /* Animation: GIF left-aligned, legend to the right */
+    .anim-wrap {{ display: flex; flex-direction: row; align-items: flex-start; gap: 1.2rem; }}
+    .anim-img {{ height: 260px; width: auto; display: block; border-radius: 4px; }}
+    .anim-meta {{ display: flex; flex-direction: column; gap: 0.4rem; padding-top: 0.2rem; }}
+    .anim-title {{ font-size: 0.85rem; color: #c9d1d9; font-weight: 600; }}
+    .anim-legend {{ font-size: 0.8rem; color: #8b949e; line-height: 2.0; }}
     .cold {{ color: #4488ff; }}
     .hot  {{ color: #ff6644; }}
     .sp-up {{ color: #ddd; }}
