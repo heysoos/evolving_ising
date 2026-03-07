@@ -11,6 +11,8 @@ Design constraints
 - Functions that produce images for the HTML report return base64-encoded
   PNG strings (via `fig_to_base64`) so the report is fully self-contained
   and portable (no external image files needed).
+- `make_rollout_animation` returns a base64-encoded GIF string embedding a
+  combined temperature+spin animation.  Requires Pillow; returns "" otherwise.
 - `save_fitness_plot` writes a richer version of the fitness curve directly
   to disk alongside each experiment's other output files.
 - `generate_report` assembles the full HTML document from
@@ -21,22 +23,21 @@ from __future__ import annotations
 import base64
 import io
 import os
-from typing import Dict, List, TYPE_CHECKING
+import tempfile
+from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import matplotlib
 matplotlib.use("Agg")   # non-interactive backend; safe for headless/WSL use
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 
-# TYPE_CHECKING guard avoids a circular import at runtime:
-# experiment.py imports from viz.py, so we cannot import ExperimentResult
-# at module level here without creating a cycle.  The import only runs
-# during static type analysis (e.g. mypy), not at runtime.
 if TYPE_CHECKING:
     from .experiment import ExperimentResult
 
 
-# ── Low-level helper ─────────────────────────────────────────────────────────
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def fig_to_base64(fig) -> str:
     """
@@ -44,8 +45,6 @@ def fig_to_base64(fig) -> str:
 
     Used to embed images inline in the HTML report as data URIs:
         <img src="data:image/png;base64,{fig_to_base64(fig)}">
-
-    The figure is closed after encoding to free memory.
     """
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
@@ -54,17 +53,60 @@ def fig_to_base64(fig) -> str:
     return base64.b64encode(buf.read()).decode("ascii")
 
 
+def _composite_frame(
+    T_flat: np.ndarray,
+    S_flat: np.ndarray,
+    H: int,
+    W: int,
+    hot_t: float,
+    cold_t: float,
+) -> np.ndarray:
+    """
+    Combine a temperature field and spin configuration into a single RGB image
+    using the HSV colourspace so the two channels are unambiguous:
+
+      Hue        — temperature  (cold → blue at 0.65, hot → red at 0.0)
+      Saturation — fixed at 0.90
+      Value      — spin state   (+1 → bright 1.0,  −1 → dim 0.35)
+
+    Cold + spin=+1  : bright blue
+    Hot  + spin=+1  : bright red
+    Cold + spin=−1  : dark blue
+    Hot  + spin=−1  : dark red
+
+    Parameters
+    ----------
+    T_flat : (N,) float32  temperature values
+    S_flat : (N,) int8     spin values {-1, +1}
+    H, W   : grid height / width
+    hot_t, cold_t : temperature range for normalisation
+
+    Returns
+    -------
+    np.ndarray (H, W, 3) float32 in [0, 1]
+    """
+    T = T_flat.reshape(H, W).astype(np.float32)
+    S = S_flat.reshape(H, W).astype(np.float32)
+
+    T_norm = np.clip((T - cold_t) / max(hot_t - cold_t, 1e-8), 0.0, 1.0)
+
+    # Hue: 0.65 (blue) → 0.0 (red) as temperature rises
+    hue = 0.65 * (1.0 - T_norm)
+    sat = np.full((H, W), 0.90, dtype=np.float32)
+    # Value: spin=+1 → 1.0, spin=-1 → 0.35
+    val = 0.35 + 0.65 * (S + 1.0) / 2.0
+
+    hsv = np.stack([hue, sat, val], axis=-1)
+    return mcolors.hsv_to_rgb(hsv).astype(np.float32)
+
+
 # ── Fitness plots ─────────────────────────────────────────────────────────────
 
 def plot_fitness_curve(best_hist: List[float], best_so_far: List[float], title: str) -> str:
     """
     Compact fitness curve for embedding in the HTML report.
 
-    Shows two series:
-    - "best so far": monotonically non-decreasing global best — the true
-      learning curve showing optimisation progress.
-    - "best (iter)": best individual in each generation's population — noisier
-      because a lucky sample can temporarily exceed the running best.
+    Shows "best so far" (monotone global best) and "best (iter)" (noisy per-generation best).
 
     Returns
     -------
@@ -94,18 +136,7 @@ def save_fitness_plot(
     """
     Save a detailed fitness statistics plot to disk as a PNG.
 
-    Richer than `plot_fitness_curve` — adds the population mean and
-    mean ± std shading so you can see whether the whole distribution is
-    improving or just getting lucky outliers.
-
-    Parameters
-    ----------
-    best_hist   : per-iteration best (noisy)
-    best_so_far : running global best (monotone)
-    mean_hist   : per-iteration population mean
-    std_hist    : per-iteration population standard deviation
-    title       : plot title
-    path        : full file path to write (e.g. ".../fitness_stats.png")
+    Includes the population mean ± std band in addition to the best curves.
     """
     fig, ax = plt.subplots(figsize=(7, 4))
     iters    = np.arange(1, len(best_hist) + 1)
@@ -133,8 +164,8 @@ def plot_temperature(T_final: np.ndarray, H: int, W: int, title: str, hot_t: flo
     """
     Heatmap of the final temperature field.
 
-    The colormap is fixed to [cold_t, hot_t] across all experiments so
-    that temperatures are visually comparable between objectives.
+    The colormap is fixed to [cold_t, hot_t] so temperatures are visually
+    comparable across experiments.
 
     Returns
     -------
@@ -153,8 +184,8 @@ def plot_spins(S_final: np.ndarray, H: int, W: int, title: str) -> str:
     """
     Grayscale image of the final spin configuration.
 
-    Black = spin -1, white = spin +1.  Ordered (ferromagnetic) regions
-    appear as uniform patches; disordered (paramagnetic) regions are speckled.
+    Black = spin −1 (ordered down), white = spin +1 (ordered up).
+    Uniform patches = ferromagnetic domains, speckled = paramagnetic.
 
     Returns
     -------
@@ -168,6 +199,41 @@ def plot_spins(S_final: np.ndarray, H: int, W: int, title: str) -> str:
     return fig_to_base64(fig)
 
 
+def plot_temp_and_spins(
+    T_final: np.ndarray,
+    S_final: np.ndarray,
+    H: int,
+    W: int,
+    title: str,
+    hot_t: float,
+    cold_t: float,
+) -> str:
+    """
+    Temperature and spin side-by-side in one figure.
+
+    Both panels are the same (H, W) size so they align naturally.
+    The temperature colormap uses a fixed [cold_t, hot_t] scale.
+
+    Returns
+    -------
+    str  base64-encoded PNG
+    """
+    fig, axs = plt.subplots(1, 2, figsize=(7, 3.5))
+
+    im = axs[0].imshow(T_final.reshape(H, W), cmap="magma", vmin=cold_t, vmax=hot_t)
+    axs[0].set_title("Temperature")
+    axs[0].axis("off")
+    plt.colorbar(im, ax=axs[0], fraction=0.046, pad=0.04)
+
+    axs[1].imshow(S_final.reshape(H, W), cmap="gray", vmin=-1, vmax=1)
+    axs[1].set_title("Spins")
+    axs[1].axis("off")
+
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
 def plot_connectivity(
     J_nk:      np.ndarray,   # (N, K) float32
     mask:      np.ndarray,   # (N, K) bool
@@ -175,50 +241,94 @@ def plot_connectivity(
     H: int,
     W: int,
     title: str,
+    sigma_ref: float = 0.5,
+    j_scale:   float = 1.0,
 ) -> str:
     """
-    Three-panel visualisation of the learned coupling structure.
+    Five-panel visualisation of the learned coupling structure.
 
-    Panels
-    ------
+    Top row (maps, same as before)
+    -----
     In-degree  (Reds):   total incoming conductance at each site
-                         Σ_{j: j→i} |J[j, k(j→i)]|
     Out-degree (Greens): total outgoing conductance from each site
-                         Σ_k |J[i,k]| (valid slots only)
     Composite  (RGB):    R=normalised in-degree, G=normalised out-degree, B=0
-                         Bright red sites are heat sinks; bright green are sources.
 
-    The in-degree is computed with `np.add.at` (unbuffered scatter-add),
-    which correctly accumulates when multiple sources share the same target.
-    Invalid bond slots have W_plot[i,k]=0 (masked), so they contribute 0 even
-    though their neighbor index may be 0.
+    Bottom row (histograms)
+    ----------
+    Overlapping histograms comparing the J distribution at the start of
+    optimisation (reference, sampled from softplus(N(0, sigma_ref)) with a
+    fixed seed) versus the learned J at the end.  The overlap reveals how
+    much the CMA-ES has shifted and spread the coupling distribution.
+
+    Parameters
+    ----------
+    J_nk, mask, neighbors : arrays from IsingModel / ExperimentResult
+    H, W                  : grid dimensions
+    title                 : figure suptitle
+    sigma_ref             : std-dev of the reference theta distribution
+                            (should match sigma_init used during optimisation)
+    j_scale               : j_scale multiplier used during optimisation
 
     Returns
     -------
     str  base64-encoded PNG
     """
     N = H * W
-    # Zero out invalid neighbour slots before computing degrees
+
+    # ── Spatial degree maps ───────────────────────────────────────────────────
     W_plot  = np.abs(J_nk) * mask.astype(np.float32)   # (N, K)
     out_deg = np.sum(W_plot, axis=1)                     # (N,)
 
-    # Scatter-accumulate incoming weights: for each directed edge (i→j)
-    # with weight w, add w to in_deg[j].
-    dest    = neighbors.reshape(-1)       # flat target indices
-    weights = W_plot.reshape(-1)          # corresponding weights
-    in_deg  = np.zeros(N, dtype=np.float32)
-    np.add.at(in_deg, dest, weights)     # unbuffered accumulation (handles duplicates)
+    dest   = neighbors.reshape(-1)
+    weights= W_plot.reshape(-1)
+    in_deg = np.zeros(N, dtype=np.float32)
+    np.add.at(in_deg, dest, weights)
 
     in_norm  = in_deg  / (np.max(in_deg)  + 1e-8)
     out_norm = out_deg / (np.max(out_deg) + 1e-8)
     RGB = np.stack([in_norm, out_norm, np.zeros(N)], axis=-1).reshape(H, W, 3)
 
-    fig, axs = plt.subplots(1, 3, figsize=(10, 3.5))
-    axs[0].imshow(in_deg.reshape(H, W),  cmap="Reds");   axs[0].set_title("In-degree");   axs[0].axis("off")
-    axs[1].imshow(out_deg.reshape(H, W), cmap="Greens"); axs[1].set_title("Out-degree");  axs[1].axis("off")
-    axs[2].imshow(RGB);                                   axs[2].set_title("R=in, G=out"); axs[2].axis("off")
+    # ── Before / after J distribution ────────────────────────────────────────
+    D = int(np.sum(mask))
+    rng       = np.random.default_rng(0)
+    theta_ref = rng.standard_normal(D) * sigma_ref
+    # softplus = log(1 + exp(x))
+    J_ref     = np.log1p(np.exp(theta_ref)) * j_scale
+    J_learned = np.abs(J_nk[mask])
+
+    # ── Layout: 2 rows (maps | histogram) ────────────────────────────────────
+    fig = plt.figure(figsize=(10, 6))
+    gs  = fig.add_gridspec(2, 3, height_ratios=[1.2, 0.9], hspace=0.4, wspace=0.3)
+
+    ax_in  = fig.add_subplot(gs[0, 0])
+    ax_out = fig.add_subplot(gs[0, 1])
+    ax_rgb = fig.add_subplot(gs[0, 2])
+    ax_hist= fig.add_subplot(gs[1, :])   # spans all 3 columns
+
+    ax_in .imshow(in_deg.reshape(H, W),  cmap="Reds")
+    ax_in .set_title("In-degree")
+    ax_in .axis("off")
+
+    ax_out.imshow(out_deg.reshape(H, W), cmap="Greens")
+    ax_out.set_title("Out-degree")
+    ax_out.axis("off")
+
+    ax_rgb.imshow(RGB)
+    ax_rgb.set_title("R=in,  G=out")
+    ax_rgb.axis("off")
+
+    bins = np.linspace(0.0, max(np.max(J_learned), np.max(J_ref)) * 1.05, 60)
+    ax_hist.hist(J_ref,     bins=bins, alpha=0.5, color="steelblue",
+                 label=f"Initial reference  (softplus(N(0,{sigma_ref}))·{j_scale})")
+    ax_hist.hist(J_learned, bins=bins, alpha=0.5, color="tomato",
+                 label="Learned  (|J_best| at valid bonds)")
+    ax_hist.set_xlabel("|J| coupling strength")
+    ax_hist.set_ylabel("Count")
+    ax_hist.set_title("Coupling distribution: before vs after optimisation")
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(True, alpha=0.25)
+
     fig.suptitle(title, fontsize=11)
-    fig.tight_layout()
     return fig_to_base64(fig)
 
 
@@ -232,8 +342,8 @@ def plot_comparison(
     """
     Side-by-side temperature heatmaps for all experiments on one row.
 
-    All panels share the same colormap limits [cold_t, hot_t] so the
-    differences in heat transport between objectives are directly visible.
+    All panels share the same colormap limits so differences in heat transport
+    are directly visible across objectives.
 
     Returns
     -------
@@ -242,7 +352,7 @@ def plot_comparison(
     n = len(all_T_finals)
     fig, axs = plt.subplots(1, n, figsize=(4 * n, 4))
     if n == 1:
-        axs = [axs]   # keep iterable even for single experiment
+        axs = [axs]
     for ax, (name, T_final) in zip(axs, all_T_finals.items()):
         ax.imshow(T_final.reshape(H, W), cmap="magma", vmin=cold_t, vmax=hot_t)
         ax.set_title(name, fontsize=9)
@@ -252,39 +362,113 @@ def plot_comparison(
     return fig_to_base64(fig)
 
 
+# ── Animation ─────────────────────────────────────────────────────────────────
+
+def make_rollout_animation(
+    T_frames: Sequence[np.ndarray],
+    S_frames: Sequence[np.ndarray],
+    H: int,
+    W: int,
+    hot_t: float,
+    cold_t: float,
+    fps: int = 15,
+) -> str:
+    """
+    Generate an animated GIF from a sequence of temperature and spin frames,
+    encoding both channels into a single HSV image per frame (see
+    `_composite_frame` for the encoding).
+
+    The animation is encoded as base64 GIF so it can be embedded directly
+    in the HTML report as a data URI.  Returns an empty string if Pillow is
+    not available (the report will simply omit the animation section).
+
+    Parameters
+    ----------
+    T_frames : sequence of (N,) float32 arrays, one per timestep
+    S_frames : sequence of (N,) int8 arrays, one per timestep
+    H, W     : grid dimensions
+    hot_t, cold_t : temperature range for normalisation
+    fps      : frames per second for the GIF
+
+    Returns
+    -------
+    str  base64-encoded GIF, or "" if Pillow is unavailable
+    """
+    try:
+        import PIL  # noqa: F401  just check availability
+    except ImportError:
+        return ""
+
+    frames_rgb = [
+        _composite_frame(T_frames[i], S_frames[i], H, W, hot_t, cold_t)
+        for i in range(len(T_frames))
+    ]
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    fig.subplots_adjust(left=0, right=1, top=0.92, bottom=0)
+    im = ax.imshow(frames_rgb[0], vmin=0.0, vmax=1.0)
+    ax.set_title("Temperature (hue)  ·  Spin (brightness)", fontsize=8, pad=4)
+    ax.axis("off")
+
+    def _update(i):
+        im.set_data(frames_rgb[i])
+        return (im,)
+
+    ani = FuncAnimation(fig, _update, frames=len(frames_rgb),
+                        interval=1000 // fps, blit=True)
+
+    # Save to a temp file then read back (more portable than BytesIO with pillow writer)
+    tmp = tempfile.NamedTemporaryFile(suffix=".gif", delete=False)
+    tmp.close()
+    try:
+        ani.save(tmp.name, writer="pillow", fps=fps,
+                 savefig_kwargs={"dpi": 72})
+        with open(tmp.name, "rb") as f:
+            gif_bytes = f.read()
+    finally:
+        plt.close(fig)
+        os.unlink(tmp.name)
+
+    return base64.b64encode(gif_bytes).decode("ascii")
+
+
 # ── HTML report ───────────────────────────────────────────────────────────────
 
 def generate_report(
-    results:    List[ExperimentResult],
-    run_dir:    str,
-    H:          int,
-    W:          int,
-    hot_t:      float,
-    cold_t:     float,
-    run_config: dict,
+    results:      "List[ExperimentResult]",
+    run_dir:      str,
+    H:            int,
+    W:            int,
+    hot_t:        float,
+    cold_t:       float,
+    run_config:   dict,
+    rollout_data: Optional[Dict[str, tuple]] = None,
 ) -> None:
     """
     Generate a self-contained HTML report for the full experiment run.
 
-    The report embeds all figures as base64 PNGs (no external files needed)
-    and includes a summary table for quick cross-experiment comparison.
-
-    The EXPERIMENTS import is deferred to avoid a circular import:
-    experiment.py → objectives.py (for EXPERIMENTS), and viz.py is
-    imported by experiment.py.  Importing at the top of this module would
-    create a cycle.  Since generate_report is only called at the end of a
-    run (after all modules are already loaded), the deferred import is safe.
+    Layout per experiment card
+    --------------------------
+    Row 1 (3 columns): fitness curve | temperature | spins
+                        (temperature and spins are adjacent — same dimensions)
+    Row 2 (full width): connectivity maps + before/after J histograms
+    Row 3 (full width): temperature+spin animation (if rollout_data provided)
 
     Parameters
     ----------
-    results    : list of ExperimentResult from run_experiment()
-    run_dir    : directory where report.html is written
-    H, W       : grid dimensions (for reshaping flat arrays)
-    hot_t      : maximum temperature (colormap upper bound)
-    cold_t     : minimum temperature (colormap lower bound)
-    run_config : dict of config key→value pairs shown in the report header
+    results      : list of ExperimentResult from run_experiment()
+    run_dir      : directory where report.html is written
+    H, W         : grid dimensions (for reshaping flat arrays)
+    hot_t        : maximum temperature (colormap upper bound)
+    cold_t       : minimum temperature (colormap lower bound)
+    run_config   : dict of config key→value pairs shown in the report header
+    rollout_data : optional dict mapping experiment name →
+                   (T_frames, S_frames) where each is a list of (N,) arrays.
+                   When provided, an animation is embedded in each card.
     """
     from .experiment import EXPERIMENTS  # deferred to break circular import
+
+    rollout_data = rollout_data or {}
 
     experiment_sections = []
     all_T_finals = {}
@@ -292,12 +476,35 @@ def generate_report(
     for r in results:
         info = EXPERIMENTS[r.name]
 
-        # Generate the four per-experiment figures
-        fig_fitness = plot_fitness_curve(r.best_hist, r.best_so_far, f"Fitness — {info['title']}")
-        fig_temp    = plot_temperature(r.T_final, H, W, f"Temperature — {r.name}", hot_t, cold_t)
-        fig_spins   = plot_spins(r.S_final, H, W, f"Spins — {r.name}")
-        fig_conn    = plot_connectivity(r.J_best, r.mask, r.neighbors, H, W, f"Connectivity — {r.name}")
+        fig_fitness  = plot_fitness_curve(r.best_hist, r.best_so_far,
+                                          f"Fitness — {info['title']}")
+        fig_ts       = plot_temp_and_spins(r.T_final, r.S_final, H, W,
+                                           f"{r.name}", hot_t, cold_t)
+        fig_conn     = plot_connectivity(r.J_best, r.mask, r.neighbors, H, W,
+                                         f"Connectivity — {r.name}")
         all_T_finals[r.name] = r.T_final
+
+        # Optional animation section
+        anim_html = ""
+        if r.name in rollout_data:
+            T_frames, S_frames = rollout_data[r.name]
+            gif_b64 = make_rollout_animation(T_frames, S_frames, H, W, hot_t, cold_t)
+            if gif_b64:
+                anim_html = f"""
+            <div class="wide-panel">
+                <div class="panel-label">Animation — temperature (hue) &amp; spins (brightness)</div>
+                <div class="anim-wrap">
+                    <img src="data:image/gif;base64,{gif_b64}" alt="Animation" class="anim-img">
+                    <div class="anim-legend">
+                        <span class="cold">■ cold</span>
+                        <span class="hot">■ hot</span>
+                        &nbsp;|&nbsp;
+                        <span class="sp-up">bright = spin +1</span>
+                        &nbsp;·&nbsp;
+                        <span class="sp-dn">dark = spin −1</span>
+                    </div>
+                </div>
+            </div>"""
 
         experiment_sections.append(f"""
         <div class="experiment-card">
@@ -310,12 +517,13 @@ def generate_report(
                 <span>Mean temp: <strong>{r.mean_temp:.4f}</strong></span>
                 <span>Runtime: <strong>{r.elapsed:.1f}s</strong></span>
             </div>
-            <div class="grid2x2">
+            <div class="grid-top">
                 <div><img src="data:image/png;base64,{fig_fitness}" alt="Fitness"></div>
-                <div><img src="data:image/png;base64,{fig_temp}" alt="Temperature"></div>
-                <div><img src="data:image/png;base64,{fig_spins}" alt="Spins"></div>
-                <div><img src="data:image/png;base64,{fig_conn}" alt="Connectivity"></div>
+                <div><img src="data:image/png;base64,{fig_ts}" alt="Temp+Spins"></div>
             </div>
+            <div class="wide-panel">
+                <img src="data:image/png;base64,{fig_conn}" alt="Connectivity">
+            </div>{anim_html}
         </div>""")
 
     fig_comparison = plot_comparison(all_T_finals, H, W, hot_t, cold_t)
@@ -326,7 +534,9 @@ def generate_report(
         for r in results
     )
 
-    config_items = " | ".join(f"<code>{k}</code>: <code>{v}</code>" for k, v in run_config.items())
+    config_items = " | ".join(
+        f"<code>{k}</code>: <code>{v}</code>" for k, v in run_config.items()
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -348,8 +558,22 @@ def generate_report(
     .metrics {{ display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1rem;
                 font-size: 0.9rem; color: #8b949e; }}
     .metrics strong {{ color: #c9d1d9; }}
-    .grid2x2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }}
-    .grid2x2 img {{ width: 100%; border-radius: 4px; }}
+    /* Row 1: fitness (wider) + temp/spins (square panels in one image) */
+    .grid-top {{ display: grid; grid-template-columns: 1.4fr 1fr; gap: 0.5rem; margin-bottom: 0.5rem; }}
+    .grid-top img {{ width: 100%; border-radius: 4px; }}
+    /* Full-width panel below (connectivity, animation) */
+    .wide-panel {{ margin-top: 0.5rem; }}
+    .wide-panel img {{ width: 100%; border-radius: 4px; }}
+    .panel-label {{ font-size: 0.78rem; color: #8b949e; margin-bottom: 0.25rem; }}
+    /* Animation layout */
+    .anim-wrap {{ display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; }}
+    .anim-img {{ border-radius: 4px; max-height: 320px; width: auto; }}
+    .anim-legend {{ font-size: 0.78rem; color: #8b949e; }}
+    .cold {{ color: #4488ff; }}
+    .hot  {{ color: #ff6644; }}
+    .sp-up {{ color: #ddd; }}
+    .sp-dn {{ color: #666; }}
+    /* Global panels */
     .panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
               padding: 1.5rem; margin-bottom: 2rem; }}
     .panel img {{ width: 100%; border-radius: 4px; }}
@@ -363,7 +587,7 @@ def generate_report(
 </head>
 <body>
 <h1>Evolving Ising — Loss Function Comparison</h1>
-<p class="subtitle">CMA-ES optimization with different fitness objectives on a {H}×{W} Ising lattice</p>
+<p class="subtitle">CMA-ES optimisation with different fitness objectives on a {H}×{W} Ising lattice</p>
 
 <div class="config"><strong>Configuration:</strong> {config_items}</div>
 
