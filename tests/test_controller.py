@@ -8,7 +8,7 @@ Checks:
 import numpy as np
 import pytest
 
-from controller import LocalController, LocalMagnetisationTracker
+from work_extraction.controller import LocalController, LocalMagnetisationTracker
 
 
 def test_round_trip():
@@ -42,7 +42,7 @@ def test_output_bounds():
 
     # Generate 10,000 random inputs
     x = rng.standard_normal((10000, 5)).astype(np.float32)
-    out = ctrl.forward(x)
+    out = np.asarray(ctrl.forward(x))
 
     assert out.shape == (10000, 1)
     assert np.all(out >= -delta_J_max), f"Min output: {out.min()}"
@@ -68,7 +68,7 @@ def test_propose_updates():
     m_bar = rng.standard_normal(n_bonds).astype(np.float32) * 0.5
     budget_norm = rng.uniform(-1, 1, size=n_bonds).astype(np.float32)
 
-    delta_J = ctrl.propose_updates(s_i, s_j, m_bar, T_norm=0.5, budget_norm=budget_norm)
+    delta_J = np.asarray(ctrl.propose_updates(s_i, s_j, m_bar, T_norm=0.5, budget_norm=budget_norm))
     assert delta_J.shape == (n_bonds,)
     assert np.all(np.abs(delta_J) <= 0.1)
 

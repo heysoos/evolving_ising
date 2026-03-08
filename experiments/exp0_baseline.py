@@ -16,8 +16,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from evolving_ising.model import IsingModel
-from thermodynamics import run_cycle_with_accounting, run_multiple_cycles
-from train import DEFAULT_CONFIG
+from work_extraction.thermodynamics import run_cycle_with_accounting, run_multiple_cycles
+from work_extraction.train import DEFAULT_CONFIG
 
 
 def run_baseline_sweep(config=None, results_dir='results/exp0'):

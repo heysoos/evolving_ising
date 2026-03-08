@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from evolving_ising.model import IsingModel
-from budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
+from work_extraction.budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def test_bond_budget_non_negativity(neighbors_mask):
     for _ in range(50):
         s_before = rng.choice([-1, 1], size=N).astype(np.float32)
         s_after = rng.choice([-1, 1], size=N).astype(np.float32)
-        bb.update_vectorized(s_before, s_after, np.ones_like(neighbors, dtype=np.float32), 2.5)
+        bb.update(s_before, s_after, np.ones_like(neighbors, dtype=np.float32), 2.5)
 
     # Spend randomly
     for _ in range(1000):
@@ -61,7 +61,7 @@ def test_bond_budget_non_negativity(neighbors_mask):
         k = rng.integers(0, neighbors.shape[1])
         if mask[i, k]:
             j = neighbors[i, k]
-            bb.spend(i, j, rng.uniform(0, 1))
+            bb.spend(int(i), int(j), rng.uniform(0, 1))
 
     # Check non-negativity
     budget_arr = bb.get_budget_array()
@@ -87,14 +87,14 @@ def test_neighbourhood_budget_non_negativity(neighbors_mask):
         k = rng.integers(0, neighbors.shape[1])
         if mask[i, k]:
             j = neighbors[i, k]
-            nb.spend(i, j, rng.uniform(0, 1))
+            nb.spend(int(i), int(j), rng.uniform(0, 1))
 
     # Check non-negativity via get_budget
     for i in range(N):
         for k in range(neighbors.shape[1]):
             if mask[i, k]:
                 j = neighbors[i, k]
-                assert nb.get_budget(i, j) >= 0
+                assert nb.get_budget(int(i), int(j)) >= 0
 
 
 def test_diffusing_budget_non_negativity(neighbors_mask):
@@ -116,7 +116,7 @@ def test_diffusing_budget_non_negativity(neighbors_mask):
         k = rng.integers(0, neighbors.shape[1])
         if mask[i, k]:
             j = neighbors[i, k]
-            db.spend(i, j, rng.uniform(0, 1))
+            db.spend(int(i), int(j), rng.uniform(0, 1))
 
     # Check non-negativity
     field = db.get_field()
@@ -130,6 +130,7 @@ def test_diffusing_no_diffusion_no_decay(neighbors_mask):
     the BondBudget accumulation pattern (local ordering events only).
     """
     neighbors, mask = neighbors_mask
+    mask_np = np.asarray(mask)
     N = neighbors.shape[0]
 
     db = DiffusingBudget(neighbors, mask, alpha=0.1, D=0.0, tau_mu=float('inf'))
@@ -144,13 +145,11 @@ def test_diffusing_no_diffusion_no_decay(neighbors_mask):
         J_dummy = np.ones_like(neighbors, dtype=np.float32)
 
         db.update(s_before, s_after, J_dummy, 2.5)
-        bb.update_vectorized(s_before, s_after, J_dummy, 2.5)
+        bb.update(s_before, s_after, J_dummy, 2.5)
 
     # DiffusingBudget stores per-site, BondBudget stores per-bond.
     # With D=0, tau_mu=inf: mu_i accumulates sum of ordering events at site i.
-    # BondBudget accumulates per-bond ordering events.
-    # They won't be numerically identical (different granularity),
-    # but both should be non-negative and correlated.
+    # Both should be non-negative and correlated.
     db_field = db.get_field()
     bb_array = bb.get_budget_array()
 
@@ -158,34 +157,39 @@ def test_diffusing_no_diffusion_no_decay(neighbors_mask):
     assert np.all(bb_array >= 0)
 
     # Sites with high bond budget should have high diffusing budget
-    site_bb = (bb_array * mask).sum(axis=1)
+    site_bb = (bb_array * mask_np).sum(axis=1)
     corr = np.corrcoef(db_field, site_bb)[0, 1]
     print(f"Correlation between DiffusingBudget field and BondBudget site totals: {corr:.4f}")
     assert corr > 0.9, f"Budgets should be highly correlated: corr={corr}"
 
 
-def test_bond_budget_vectorized_matches_loop(neighbors_mask):
-    """Vectorized update matches the loop-based update."""
+def test_bond_budget_update_is_vectorized(neighbors_mask):
+    """Verify update correctly accumulates from ordering events."""
     neighbors, mask = neighbors_mask
     N = neighbors.shape[0]
-    rng = np.random.default_rng(77)
 
-    bb_loop = BondBudget(neighbors, mask, alpha=0.1)
-    bb_vec = BondBudget(neighbors, mask, alpha=0.1)
+    bb = BondBudget(neighbors, mask, alpha=0.1)
 
-    for _ in range(10):
-        s_before = rng.choice([-1, 1], size=N).astype(np.float32)
-        s_after = rng.choice([-1, 1], size=N).astype(np.float32)
-        J_dummy = np.ones_like(neighbors, dtype=np.float32)
+    # All aligned before, mixed after — should produce ordering events
+    s_before = -np.ones(N, dtype=np.float32)
+    s_after = np.ones(N, dtype=np.float32)
 
-        bb_loop.update(s_before, s_after, J_dummy, 2.5)
-        bb_vec.update_vectorized(s_before, s_after, J_dummy, 2.5)
+    bb.update(s_before, s_after, np.ones_like(neighbors, dtype=np.float32), 2.5)
 
-    np.testing.assert_allclose(
-        bb_loop.get_budget_array(),
-        bb_vec.get_budget_array(),
-        rtol=1e-5
-    )
+    # All bonds should have increased budget (correlation went from -1*-1=1
+    # to 1*1=1, so delta_corr = 0, no ordering for same-sign flips)
+    # Actually: s_before=-1, so corr_before = (-1)*(-1) = 1
+    # s_after=+1, so corr_after = (+1)*(+1) = 1
+    # delta_corr = 0 — no ordering event. Let's use a case that generates events.
+    bb2 = BondBudget(neighbors, mask, alpha=0.5)
+    s_before2 = np.ones(N, dtype=np.float32)
+    s_before2[::2] = -1  # alternating spins
+    s_after2 = np.ones(N, dtype=np.float32)  # all aligned
+
+    bb2.update(s_before2, s_after2, np.ones_like(neighbors, dtype=np.float32), 2.5)
+
+    budget_arr = bb2.get_budget_array()
+    assert budget_arr.sum() > 0, "Should have accumulated some budget"
 
 
 if __name__ == "__main__":

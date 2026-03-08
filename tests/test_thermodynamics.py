@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import pytest
 
 from evolving_ising.model import IsingModel
-from thermodynamics import (
+from work_extraction.thermodynamics import (
     CycleAccumulator,
     temperature_schedule,
     run_cycle_with_accounting,

@@ -9,7 +9,7 @@ Expected: Non-monotonic W_net vs. gamma with a peak at some gamma*.
 
 import os
 import numpy as np
-from train import run_experiment, DEFAULT_CONFIG
+from work_extraction.train import run_experiment, DEFAULT_CONFIG
 
 
 def run_exp2(best_lambda=0.01, best_alpha=0.1, config=None,

@@ -2,11 +2,57 @@
 
 LocalController: small MLP (5 -> 8 -> 8 -> 1) with tanh activations.
 Weights stored as a flat numpy array for CMA-ES compatibility.
+Forward pass uses JAX for GPU acceleration.
 
 LocalMagnetisationTracker: exponential moving average of spin field.
 """
 
 import numpy as np
+import jax
+import jax.numpy as jnp
+from functools import partial
+
+
+def _mlp_forward(params_flat, x, layer_specs, delta_J_max):
+    """Pure-function JAX MLP forward pass.
+
+    Parameters
+    ----------
+    params_flat : array (n_params,)
+        Flat parameter vector (JAX array).
+    x : array (..., 5)
+        Input features.
+    layer_specs : tuple of (name, shape) pairs
+        Layer specifications for unpacking.
+    delta_J_max : float
+        Output scaling.
+
+    Returns
+    -------
+    array (..., 1) in [-delta_J_max, delta_J_max].
+    """
+    # Unpack params
+    offset = 0
+    layers = {}
+    for name, shape in layer_specs:
+        size = 1
+        for s in shape:
+            size *= s
+        layers[name] = jax.lax.dynamic_slice(
+            params_flat, (offset,), (size,)
+        ).reshape(shape)
+        offset += size
+
+    h = jnp.tanh(x @ layers['W1'] + layers['b1'])
+    h = jnp.tanh(h @ layers['W2'] + layers['b2'])
+    out = jnp.tanh(h @ layers['W3'] + layers['b3'])
+    return out * delta_J_max
+
+
+# JIT-compile the forward pass; layer_specs and delta_J_max are static
+@partial(jax.jit, static_argnums=(2, 3))
+def _mlp_forward_jit(params_flat, x, layer_specs, delta_J_max):
+    return _mlp_forward(params_flat, x, layer_specs, delta_J_max)
 
 
 class LocalController:
@@ -17,18 +63,9 @@ class LocalController:
 
     Inputs per bond (i, j):
         [s_i, s_j, m_bar_i, T_norm, budget_norm]
-    where:
-        s_i, s_j: spin values (-1 or +1)
-        m_bar_i: local magnetisation EMA at site i
-        T_norm: (T - T_mean) / delta_T (normalised temperature)
-        budget_norm: tanh(B / B_scale) (normalised budget)
 
-    Parameters
-    ----------
-    delta_J_max : float
-        Maximum coupling change magnitude.
-    hidden_size : int
-        Hidden layer width (default 8).
+    The forward pass runs on GPU via JAX JIT. Parameters are stored as
+    numpy for CMA-ES compatibility and converted to JAX on demand.
     """
 
     def __init__(self, delta_J_max=0.1, hidden_size=8):
@@ -37,21 +74,21 @@ class LocalController:
         self.input_size = 5
         self.output_size = 1
 
-        # Layer shapes
-        self._shapes = [
+        self._layer_specs = (
             ('W1', (self.input_size, hidden_size)),
             ('b1', (hidden_size,)),
             ('W2', (hidden_size, hidden_size)),
             ('b2', (hidden_size,)),
             ('W3', (hidden_size, self.output_size)),
             ('b3', (self.output_size,)),
-        ]
+        )
 
-        # Total parameter count
-        self.n_params = sum(np.prod(s) for _, s in self._shapes)
+        self.n_params = sum(
+            int(np.prod(s)) for _, s in self._layer_specs
+        )
 
-        # Initialize with small random weights
         self._params = np.zeros(self.n_params, dtype=np.float32)
+        self._params_jax = jnp.zeros(self.n_params, dtype=jnp.float32)
 
     def get_params(self):
         """Return flat parameter vector (numpy array)."""
@@ -63,69 +100,55 @@ class LocalController:
         assert len(params) == self.n_params, \
             f"Expected {self.n_params} params, got {len(params)}"
         self._params = params.copy()
-
-    def _unpack(self):
-        """Unpack flat params into weight matrices and biases."""
-        layers = {}
-        offset = 0
-        for name, shape in self._shapes:
-            size = int(np.prod(shape))
-            layers[name] = self._params[offset:offset + size].reshape(shape)
-            offset += size
-        return layers
+        self._params_jax = jnp.array(params)
 
     def forward(self, x):
-        """Forward pass through the MLP.
+        """Forward pass through the MLP (JAX, GPU-accelerated).
 
         Parameters
         ----------
         x : array (..., 5)
-            Input features. Can be batched.
+            Input features. Accepts numpy or JAX arrays.
 
         Returns
         -------
-        delta_J : array (..., 1)
-            Proposed coupling changes in [-delta_J_max, delta_J_max].
+        delta_J : array (..., 1) in [-delta_J_max, delta_J_max].
         """
-        layers = self._unpack()
+        x_jax = jnp.asarray(x, dtype=jnp.float32)
+        return _mlp_forward_jit(
+            self._params_jax, x_jax,
+            self._layer_specs, self.delta_J_max,
+        )
 
-        # Layer 1
-        h = np.tanh(x @ layers['W1'] + layers['b1'])
-        # Layer 2
-        h = np.tanh(h @ layers['W2'] + layers['b2'])
-        # Output layer
-        out = np.tanh(h @ layers['W3'] + layers['b3'])
-
-        return out * self.delta_J_max
+    def forward_np(self, x):
+        """Forward pass returning numpy (for compatibility)."""
+        return np.asarray(self.forward(x))
 
     def propose_updates(self, s_i, s_j, m_bar, T_norm, budget_norm):
         """Propose bond coupling changes for a set of bonds.
 
+        All inputs are converted to JAX arrays. Returns JAX array.
+
         Parameters
         ----------
         s_i, s_j : array (n_bonds,)
-            Spin values at bond endpoints.
         m_bar : array (n_bonds,)
-            Local magnetisation EMA at site i of each bond.
         T_norm : float
-            Normalised temperature (T - T_mean) / delta_T.
         budget_norm : array (n_bonds,)
-            Normalised budget tanh(B / B_scale) per bond.
 
         Returns
         -------
-        delta_J : array (n_bonds,)
-            Proposed coupling changes.
+        delta_J : JAX array (n_bonds,)
         """
-        s_i = np.asarray(s_i, dtype=np.float32)
-        s_j = np.asarray(s_j, dtype=np.float32)
-        m_bar = np.asarray(m_bar, dtype=np.float32)
-        budget_norm = np.asarray(budget_norm, dtype=np.float32)
+        s_i = jnp.asarray(s_i, dtype=jnp.float32)
+        s_j = jnp.asarray(s_j, dtype=jnp.float32)
+        m_bar = jnp.asarray(m_bar, dtype=jnp.float32)
+        budget_norm = jnp.asarray(budget_norm, dtype=jnp.float32)
 
-        n = len(s_i)
-        T_arr = np.full(n, T_norm, dtype=np.float32)
+        n = s_i.shape[0]
+        T_arr = jnp.full(n, T_norm, dtype=jnp.float32)
 
-        x = np.stack([s_i, s_j, m_bar, T_arr, budget_norm], axis=-1)
+        x = jnp.stack([s_i, s_j, m_bar, T_arr, budget_norm], axis=-1)
         return self.forward(x).ravel()
 
 
@@ -133,14 +156,6 @@ class LocalMagnetisationTracker:
     """Exponential moving average of local magnetisation.
 
     Tracks m_bar_i = alpha * s_i + (1 - alpha) * m_bar_i_prev
-    for each site on the lattice.
-
-    Parameters
-    ----------
-    n_sites : int
-        Number of sites on the lattice.
-    alpha : float
-        EMA decay rate. Higher = faster adaptation.
     """
 
     def __init__(self, n_sites, alpha=0.05):
@@ -166,5 +181,4 @@ class LocalMagnetisationTracker:
         return self._m.copy()
 
     def reset(self):
-        """Reset all magnetisation values to zero."""
         self._m[:] = 0.0

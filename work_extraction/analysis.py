@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from thermodynamics import temperature_schedule_np
+from .thermodynamics import temperature_schedule_np
 
 
 FIGURES_DIR = 'figures'

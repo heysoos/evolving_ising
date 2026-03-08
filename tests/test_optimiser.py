@@ -7,7 +7,7 @@ reaches within 1% of the optimum within 200 generations.
 import numpy as np
 import pytest
 
-from optimiser import WorkExtractionES
+from work_extraction.optimiser import WorkExtractionES
 
 
 def test_cma_on_sphere():

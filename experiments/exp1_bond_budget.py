@@ -10,7 +10,7 @@ at low lambda. Increasing lambda degrades performance monotonically.
 
 import os
 import numpy as np
-from train import run_experiment, DEFAULT_CONFIG
+from work_extraction.train import run_experiment, DEFAULT_CONFIG
 
 
 def run_exp1(config=None, results_dir='results/exp1', n_generations=500):

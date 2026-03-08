@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from evolving_ising.model import IsingModel
-from train import run_experiment, DEFAULT_CONFIG
+from work_extraction.train import run_experiment, DEFAULT_CONFIG
 
 
 def estimate_correlation_length(model, J0, T, n_samples=200):

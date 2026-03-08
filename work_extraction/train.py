@@ -10,10 +10,10 @@ from typing import Optional
 
 from evolving_ising.model import IsingModel
 
-from thermodynamics import temperature_schedule
-from controller import LocalController
-from budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
-from optimiser import WorkExtractionES, evaluate_fitness
+from .thermodynamics import temperature_schedule
+from .controller import LocalController
+from .budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
+from .optimiser import WorkExtractionES, evaluate_fitness
 
 
 DEFAULT_CONFIG = {
