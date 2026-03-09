@@ -280,6 +280,73 @@ def run_multiple_cycles(model, key, spins, J_nk, T_mean, delta_T, tau,
 
 
 # ---------------------------------------------------------------------------
+# Fully on-device cycle runner (JAX only, no host transfers)
+# ---------------------------------------------------------------------------
+
+def run_cycles_jax(model, key, spins, J_nk, T_mean, delta_T, tau,
+                   steps_per_cycle, n_cycles, num_sweeps=1):
+    """Fully on-device cycle runner — no host↔device transfers.
+
+    The inner step loop uses ``lax.fori_loop`` whose bounds are **dynamic**
+    (runtime values), so XLA compiles the loop body once and accepts any
+    ``steps_per_cycle`` or ``tau`` value without recompilation.  The outer
+    cycle loop uses ``lax.scan`` with a static ``n_cycles`` length.
+
+    Temperature is computed analytically inside the loop body as
+    T(t) = T_mean + delta_T * sin(2π t / tau), avoiding any precomputed
+    T_schedule array whose shape would need to be static.
+
+    Parameters
+    ----------
+    model : IsingModel
+    key   : JAX PRNGKey
+    spins : (B, N) int8
+    J_nk  : (N, K) float32
+    T_mean, delta_T : float
+    tau             : JAX scalar float  — oscillation period (dynamic)
+    steps_per_cycle : JAX scalar int    — steps per cycle (dynamic)
+    n_cycles        : Python int        — number of cycles (static, scan length)
+    num_sweeps      : Python int        — sweeps per step (static)
+
+    Returns
+    -------
+    W_nets  : (n_cycles,) float32
+    sigmas  : (n_cycles,) float32
+    spins_f : (B, N) int8
+    key_f   : JAX PRNGKey
+    """
+    def step_fn(t, carry):
+        spins_c, key_c, Q_in, Q_out, sigma = carry
+        T_t = T_mean + delta_T * jnp.sin(
+            2.0 * jnp.pi * t.astype(jnp.float32) / tau
+        )
+        E_before = jnp.mean(model.energy(J_nk, spins_c))
+        key_c, subkey = jax.random.split(key_c)
+        spins_c, energies = model.metropolis_checkerboard_sweeps(
+            subkey, spins_c, J_nk, T_t, num_sweeps
+        )
+        delta_Q = jnp.mean(energies) - E_before
+        Q_in  = Q_in  + jnp.where(delta_Q > 0,  delta_Q, 0.0)
+        Q_out = Q_out + jnp.where(delta_Q < 0, -delta_Q, 0.0)
+        sigma = sigma + (-delta_Q / jnp.maximum(T_t, 1e-8))
+        return (spins_c, key_c, Q_in, Q_out, sigma)
+
+    def cycle_fn(carry, _):
+        spins_c, key_c = carry
+        zero = jnp.float32(0.0)
+        spins_c, key_c, Q_in, Q_out, sigma = jax.lax.fori_loop(
+            0, steps_per_cycle, step_fn,
+            (spins_c, key_c, zero, zero, zero),
+        )
+        return (spins_c, key_c), (Q_out - Q_in, sigma)
+
+    (spins_f, key_f), (W_nets, sigmas) = jax.lax.scan(
+        cycle_fn, (spins, key), None, length=n_cycles
+    )
+    return W_nets, sigmas, spins_f, key_f
+
+
+# ---------------------------------------------------------------------------
 # Remodelling work computation (JAX-accelerated)
 # ---------------------------------------------------------------------------
 

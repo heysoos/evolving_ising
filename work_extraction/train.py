@@ -4,16 +4,20 @@ Wires together IsingModel, controller, budget, and WorkExtractionES.
 """
 
 import os
+import sys
 import numpy as np
+import jax
+import jax.numpy as jnp
 from dataclasses import dataclass, field
 from typing import Optional
+from tqdm import tqdm
 
 from evolving_ising.model import IsingModel
 
 from .thermodynamics import temperature_schedule
 from .controller import LocalController
 from .budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
-from .optimiser import WorkExtractionES, evaluate_fitness
+from .optimiser import WorkExtractionES, evaluate_fitness, make_jax_eval_fn
 
 
 DEFAULT_CONFIG = {
@@ -119,12 +123,15 @@ def run_experiment(config, budget_type='none', name='experiment',
         boundary=cfg['boundary'],
     )
 
+    # Build JAX eval function and batched vmap version
+    eval_fn = make_jax_eval_fn(model, cfg, budget_type)
+    eval_batch = jax.jit(jax.vmap(eval_fn))
+
+    # Determine n_params from controller (same MLP architecture)
     controller = LocalController(
         delta_J_max=cfg['delta_J_max'],
         hidden_size=cfg['hidden_size'],
     )
-
-    budget = make_budget(budget_type, model, cfg)
 
     es = WorkExtractionES(
         n_params=controller.n_params,
@@ -132,6 +139,8 @@ def run_experiment(config, budget_type='none', name='experiment',
         sigma=cfg['sigma'],
         seed=0,
     )
+
+    master_key = jax.random.PRNGKey(0)
 
     # Training loop
     generations = []
@@ -144,23 +153,25 @@ def run_experiment(config, budget_type='none', name='experiment',
 
     n_gens = cfg['n_generations']
 
-    for gen in range(n_gens):
+    is_tty = sys.stdout.isatty()
+    log_interval = cfg['log_interval']
+
+    pbar = tqdm(range(n_gens), desc=name, unit='gen', disable=not verbose or not is_tty,
+                dynamic_ncols=True)
+    for gen in pbar:
         params_list = es.ask()
 
-        # Evaluate each candidate
-        fitnesses = []
-        for params in params_list:
-            # Each candidate gets a fresh budget
-            candidate_budget = make_budget(budget_type, model, cfg)
-            f = evaluate_fitness(
-                np.asarray(params), controller, candidate_budget, model, cfg
-            )
-            fitnesses.append(f)
+        # Evaluate entire population in parallel via vmap+jit
+        params_batch = jnp.array(np.stack(params_list))
+        master_key, *eval_keys = jax.random.split(master_key, cfg['pop_size'] + 1)
+        keys_batch = jnp.stack(eval_keys)
+        fitnesses_jax = eval_batch(params_batch, keys_batch)
+        fitnesses = list(np.asarray(fitnesses_jax))
 
         es.tell(params_list, fitnesses)
 
         gen_best = max(fitnesses)
-        gen_mean = np.mean(fitnesses)
+        gen_mean = float(np.mean(fitnesses))
 
         if gen_best > best_ever_fitness:
             best_ever_fitness = gen_best
@@ -172,10 +183,19 @@ def run_experiment(config, budget_type='none', name='experiment',
         best_fitnesses.append(gen_best)
         sigmas.append(float(np.asarray(es.cma.state.sigma)))
 
-        if verbose and (gen % cfg['log_interval'] == 0 or gen == n_gens - 1):
-            print(f"Gen {gen:4d}: mean={gen_mean:.4f}  best={gen_best:.4f}  "
-                  f"best_ever={best_ever_fitness:.4f}  "
-                  f"sigma={sigmas[-1]:.4f}")
+        # Tqdm postfix for interactive runs
+        pbar.set_postfix(best=f'{best_ever_fitness:.3f}', mean=f'{gen_mean:.3f}',
+                         sigma=f'{sigmas[-1]:.4f}')
+
+        # Plain-text periodic print for file-redirected / non-TTY runs
+        if verbose and not is_tty and (gen % log_interval == 0 or gen == n_gens - 1):
+            print(f"  [{name}] gen {gen:4d}/{n_gens}  "
+                  f"best_ever={best_ever_fitness:8.4f}  "
+                  f"gen_best={gen_best:8.4f}  "
+                  f"mean={gen_mean:8.4f}  "
+                  f"sigma={sigmas[-1]:.4f}", flush=True)
+
+    pbar.close()
 
     # Save results
     training_log = {

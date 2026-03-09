@@ -16,12 +16,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from evolving_ising.model import IsingModel
-from work_extraction.thermodynamics import run_cycle_with_accounting, run_multiple_cycles
+from work_extraction.thermodynamics import run_cycles_jax
 from work_extraction.train import DEFAULT_CONFIG
 
 
 def run_baseline_sweep(config=None, results_dir='results/exp0'):
-    """Run the baseline J0 x tau sweep.
+    """Run the baseline J0 × tau sweep using JAX vmap + nested lax.scan.
+
+    All J0 values are evaluated in parallel via jax.vmap.  A single
+    jax.jit compilation covers the entire (warmup + n_cycles × steps_per_cycle)
+    computation; subsequent tau values reuse the cached XLA binary.
 
     Returns
     -------
@@ -29,8 +33,8 @@ def run_baseline_sweep(config=None, results_dir='results/exp0'):
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
-    J0_values = np.linspace(0.2, 2.0, 10)
-    tau_values = np.logspace(np.log10(10), np.log10(1000), 8).astype(int)
+    J0_values = np.linspace(0.2, 2.0, 100)
+    tau_values = np.unique(np.logspace(np.log10(10), np.log10(1000), 80).astype(int))
 
     L = cfg['L']
     model = IsingModel(
@@ -39,45 +43,63 @@ def run_baseline_sweep(config=None, results_dir='results/exp0'):
         boundary=cfg['boundary'],
     )
 
-    T_mean = cfg['T_mean']
-    delta_T = cfg['delta_T']
-    n_cycles = 50
-    num_sweeps = cfg['num_sweeps']
+    T_mean        = cfg['T_mean']
+    delta_T       = cfg['delta_T']
+    n_cycles      = 50
+    num_sweeps    = cfg['num_sweeps']  # Python int — static (scan unrolling)
+    warmup_sweeps = 500                # Python int — static (single GPU call)
+    batch_size    = 40
+
+    mask_f = jnp.array(model.mask, dtype=jnp.float32)
+    J0_jax = jnp.array(J0_values, dtype=jnp.float32)
 
     W_net_grid = np.zeros((len(J0_values), len(tau_values)))
-    sigma_grid = np.zeros((len(J0_values), len(tau_values)))
+    sigma_grid  = np.zeros((len(J0_values), len(tau_values)))
 
-    for i, J0 in enumerate(J0_values):
-        for j, tau in enumerate(tau_values):
-            steps_per_cycle = int(tau)
-
-            J_nk = jnp.ones((model.n, model.K), dtype=jnp.float32) * J0
-            J_nk = J_nk * jnp.array(model.mask, dtype=jnp.float32)
-
-            key = jax.random.PRNGKey(42 + i * 100 + j)
-            key, init_key = jax.random.split(key)
-            spins = model.init_spins(init_key, batch_size=4)
-
-            # Warmup
-            for _ in range(100):
-                key, subkey = jax.random.split(key)
-                spins, _ = model.metropolis_checkerboard_sweeps(
-                    subkey, spins, J_nk, T_mean, 1
-                )
-
-            # Run cycles
-            spins, results, key = run_multiple_cycles(
-                model, key, spins, J_nk,
-                T_mean, delta_T, tau, steps_per_cycle,
-                n_cycles, num_sweeps,
+    # JIT + vmap over J0.  Compiles once for the fixed (n_cycles, num_sweeps)
+    # structure.  tau and steps_per_cycle are dynamic JAX arguments so
+    # different tau values in the Python loop share the same XLA binary.
+    @jax.jit
+    def sweep_tau(J0_batch, keys_batch, spins_batch, tau, steps_per_cycle):
+        def run_one(J0, key, spins):
+            J_nk = J0 * mask_f
+            # Warmup: single fused GPU call — no Python loop
+            key, subkey = jax.random.split(key)
+            spins, _ = model.metropolis_checkerboard_sweeps(
+                subkey, spins, J_nk, T_mean, warmup_sweeps
             )
+            # Cycles: fori_loop (dynamic steps) inside lax.scan (static cycles)
+            W_nets, sigmas, _, _ = run_cycles_jax(
+                model, key, spins, J_nk,
+                T_mean, delta_T, tau,
+                steps_per_cycle, n_cycles, num_sweeps,
+            )
+            return jnp.mean(W_nets), jnp.mean(sigmas)
 
-            W_net_grid[i, j] = results['W_net'].mean()
-            sigma_grid[i, j] = results['Sigma_cycle'].mean()
+        return jax.vmap(run_one)(J0_batch, keys_batch, spins_batch)
 
-            print(f"J0={J0:.2f}, tau={tau:4d}: "
-                  f"W_net={W_net_grid[i,j]:.4f}, "
-                  f"Sigma={sigma_grid[i,j]:.4f}")
+    master_key = jax.random.PRNGKey(42)
+
+    for j, tau in enumerate(tau_values):
+        master_key, *init_keys = jax.random.split(master_key, len(J0_values) + 1)
+        init_keys   = jnp.stack(init_keys)
+        spins_batch = jax.vmap(lambda k: model.init_spins(k, batch_size))(init_keys)
+
+        # steps_per_cycle = tau so each cycle covers exactly one full period.
+        # Passed as a dynamic JAX int — no recompilation across tau values.
+        W_nets, sigmas = sweep_tau(
+            J0_jax, init_keys, spins_batch,
+            jnp.float32(tau), jnp.int32(tau),
+        )
+
+        W_net_grid[:, j] = np.asarray(W_nets)
+        sigma_grid[:, j]  = np.asarray(sigmas)
+
+        best_i = int(np.argmax(W_net_grid[:, j]))
+        print(f"tau={tau:5d}: W_net=[{W_net_grid[:,j].min():.3f} … "
+              f"{W_net_grid[:,j].max():.3f}]  "
+              f"best J0={J0_values[best_i]:.2f} "
+              f"(W_net={W_net_grid[best_i,j]:.4f})")
 
     # Find optimum
     best_idx = np.unravel_index(W_net_grid.argmax(), W_net_grid.shape)

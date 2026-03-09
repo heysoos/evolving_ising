@@ -62,6 +62,14 @@ class BaseBudget:
         for i, j, c in zip(bond_i, bond_j, costs):
             self.spend(int(i), int(j), float(c))
 
+    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k, sel_j):
+        """Get budgets by (site_i, slot_k, site_j). Default uses (i,j) lookup."""
+        return self.get_all_budgets_for_bonds(sel_i, sel_j)
+
+    def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
+        """Spend by (site, slot). Default uses (i,j) spend."""
+        self.spend_all(sel_i[apply_mask], sel_j[apply_mask], costs[apply_mask])
+
 
 class NoBudget(BaseBudget):
     """Always returns inf budget. Used for Experiment 0 (no gating)."""
@@ -79,6 +87,12 @@ class NoBudget(BaseBudget):
         return jnp.full(len(bond_i), jnp.inf)
 
     def spend_all(self, bond_i, bond_j, costs):
+        pass
+
+    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k, sel_j):
+        return jnp.full(len(sel_i), jnp.inf)
+
+    def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
         pass
 
 
@@ -121,7 +135,7 @@ class BondBudget(BaseBudget):
         """Return full budget array (N, K) as numpy."""
         return np.maximum(0.0, np.asarray(self._budget))
 
-    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k):
+    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k, sel_j):
         """Get budgets by (site, slot) indices. Returns JAX array."""
         return jnp.maximum(0.0, self._budget[sel_i, sel_k])
 
@@ -135,12 +149,13 @@ class BondBudget(BaseBudget):
         return np.array([self.get_budget(int(i), int(j))
                          for i, j in zip(bond_i, bond_j)])
 
-    def spend_all_nk(self, sel_i, sel_k, costs, apply_mask):
+    def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
         """Vectorized spend by (site, slot) indices (GPU).
 
         Parameters
         ----------
         sel_i, sel_k : array (n,) int
+        sel_j : array (n,) int — ignored (slot already given by sel_k)
         costs : array (n,) float
         apply_mask : array (n,) bool — which bonds to spend on
         """
@@ -200,6 +215,12 @@ class NeighbourhoodBudget(BaseBudget):
         self._budget = self._budget.at[bond_j].add(-half)
         self._budget = jnp.maximum(0.0, self._budget)
 
+    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k, sel_j):
+        return self.get_all_budgets_for_bonds(sel_i, sel_j)
+
+    def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
+        self.spend_all(sel_i[apply_mask], sel_j[apply_mask], costs[apply_mask])
+
 
 class DiffusingBudget(BaseBudget):
     """Reaction-diffusion budget field on the lattice (eq. 13).
@@ -256,6 +277,12 @@ class DiffusingBudget(BaseBudget):
         self._mu = self._mu.at[bond_i].add(-half)
         self._mu = self._mu.at[bond_j].add(-half)
         self._mu = jnp.maximum(0.0, self._mu)
+
+    def get_all_budgets_for_bonds_nk(self, sel_i, sel_k, sel_j):
+        return self.get_all_budgets_for_bonds(sel_i, sel_j)
+
+    def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
+        self.spend_all(sel_i[apply_mask], sel_j[apply_mask], costs[apply_mask])
 
     def get_field(self):
         """Return the chemical potential field (N,) as numpy."""
