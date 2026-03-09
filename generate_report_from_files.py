@@ -10,11 +10,11 @@ with the full rollout data.
 
 Usage
 -----
-# Use the most-recently created run in experiments/
+# Use the most-recently created run in results/
 python generate_report_from_files.py
 
 # Point at a specific run directory
-python generate_report_from_files.py experiments/run_20260307_024531
+python generate_report_from_files.py results/run_20260307_024531
 
 # Control the rollout length and fps
 python generate_report_from_files.py --rollout-steps 120 --fps 20
@@ -40,8 +40,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("run_dir", nargs="?", default=None,
-                   help="Path to a run directory (e.g. experiments/run_YYYYMMDD_HHMMSS). "
-                        "Defaults to the most recently created run in experiments/.")
+                   help="Path to a run directory (e.g. results/run_YYYYMMDD_HHMMSS). "
+                        "Defaults to the most recently created run in results/.")
     p.add_argument("--rollout-steps", type=int, default=100,
                    help="Number of coupled diffusion+Metropolis steps for the animation rollout. "
                         "Default: 100.")
@@ -49,8 +49,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Frames per second for the embedded GIF animation. Default: 15.")
     p.add_argument("--no-animation", action="store_true",
                    help="Skip the rollout and animation entirely (faster).")
-    p.add_argument("--experiments-dir", default="experiments",
-                   help="Root directory that contains run subdirectories. Default: experiments/")
+    p.add_argument("--experiments-dir", default="results",
+                   help="Root directory that contains run subdirectories. Default: results/")
     return p.parse_args()
 
 
