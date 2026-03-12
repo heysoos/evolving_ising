@@ -12,8 +12,6 @@ Output: ``results_dir/report.html`` — fully self-contained (no external URLs).
 """
 
 import argparse
-import base64
-import io
 import os
 import re
 import sys
@@ -23,21 +21,27 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+
+# Ensure project root and experiments/ are on the path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))
+from report_utils import (  # noqa: E402
+    REPORT_CSS as _REPORT_CSS,
+    fig_to_b64 as _fig_to_b64_util,
+    run_anim_frames,
+    frames_to_gif_b64,
+    canvas_chart_html,
+    scenario_selector_html,
+    img_tag as _img_tag,
+    gif_tag as _gif_tag,
+    PALETTE,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _fig_to_b64(fig):
-    """Render a matplotlib figure to a base64-encoded PNG string."""
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode('ascii')
-
 
 def _load_run(run_dir):
     """Load training_log.npz from a run directory.  Returns dict or None."""
@@ -74,7 +78,7 @@ def fig_learning_curves(runs, baseline_W):
     fig.suptitle('Learning Curves — W_net vs Generation', fontsize=13, y=1.01)
 
     alpha_vals = sorted({alpha for _, alpha in runs})
-    cmap = plt.get_cmap('viridis', max(len(alpha_vals), 1))
+    cmap = matplotlib.colormaps['viridis'].resampled(max(len(alpha_vals), 1))
     alpha_color = {a: cmap(i) for i, a in enumerate(alpha_vals)}
 
     for ax_idx, lam in enumerate(lam_vals):
@@ -165,7 +169,7 @@ def fig_wnet_vs_lambda(runs, baseline_W):
         return None
 
     fig, ax = plt.subplots(figsize=(6, 4))
-    cmap = plt.get_cmap('viridis', max(len(alpha_vals), 1))
+    cmap = matplotlib.colormaps['viridis'].resampled(max(len(alpha_vals), 1))
 
     for i, alpha in enumerate(alpha_vals):
         xs, ys = [], []
@@ -196,7 +200,7 @@ def fig_wnet_vs_lambda(runs, baseline_W):
 def fig_sigma_convergence(runs):
     """CMA-ES sigma on semilogy for all runs."""
     fig, ax = plt.subplots(figsize=(7, 4))
-    cmap = plt.get_cmap('tab20', max(len(runs), 1))
+    cmap = matplotlib.colormaps['tab20'].resampled(max(len(runs), 1))
 
     for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
         sigma = data.get('sigma')
@@ -583,50 +587,8 @@ def fig_J_phase_portrait(J_bar_trace, T_trace):
 
 
 # ---------------------------------------------------------------------------
-# CSS & HTML content
+# HTML content
 # ---------------------------------------------------------------------------
-
-_CSS = """
-body {
-  font-family: Georgia, serif;
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 2em 2em 4em;
-  color: #1e2a3a;
-  background: #f8f9fb;
-  line-height: 1.75;
-}
-h1 { color: #1a3a5c; border-bottom: 3px solid #1a3a5c; padding-bottom: .4em;
-     font-size: 1.8em; margin-bottom: .3em; }
-h2 { color: #2c5282; margin-top: 2em; font-size: 1.25em;
-     border-left: 4px solid #3182ce; padding-left: .6em; }
-h3 { color: #2d3748; margin-top: 1.4em; font-size: 1.05em; }
-.card { background: #fff; border: 1px solid #d0d9e8; border-radius: 8px;
-        padding: 1.2em 1.6em; margin: 1em 0; box-shadow: 0 2px 6px rgba(0,0,0,.06); }
-.highlight { background: #ebf8ff; border-left: 4px solid #3182ce;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-.insight   { background: #f0fff4; border-left: 4px solid #276749;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-table { border-collapse: collapse; width: 100%; font-size: .88em; margin-top: .8em; }
-th { background: #2c5282; color: #fff; padding: 7px 12px; text-align: left; font-weight: 600; }
-td { padding: 6px 12px; border-bottom: 1px solid #e2e8f0; }
-tr:nth-child(even) td { background: #f7f9fc; }
-tr:hover td { background: #ebf8ff; }
-img.fig { max-width: 100%; border: 1px solid #d0d9e8; border-radius: 6px;
-          margin: .8em 0; box-shadow: 0 2px 8px rgba(0,0,0,.08); display: block; }
-.formula { font-family: 'Courier New', monospace; background: #f0f4f8;
-           border: 1px solid #d0d9e8; padding: .4em .8em; border-radius: 4px;
-           display: inline-block; margin: .3em 0; }
-.caption { font-style: italic; color: #4a5568; margin: -.4em 0 1.2em 0; font-size: .92em; }
-.pass { color: #276749; font-weight: bold; }
-.fail { color: #c53030; font-weight: bold; }
-.warn { color: #b7791f; font-weight: bold; }
-.beat-yes { color: #276749; font-weight: bold; }
-.beat-no  { color: #c53030; }
-code { background: #edf2f7; padding: 2px 6px; border-radius: 3px;
-       font-size: .88em; font-family: 'Courier New', monospace; }
-.meta { color: #718096; font-size: .9em; }
-"""
 
 _EXPLANATION = """
 <h2>1. About This Experiment</h2>
@@ -803,7 +765,7 @@ is reported.
 # HTML assembly
 # ---------------------------------------------------------------------------
 
-def generate_report(results_dir, baseline_path=None):
+def generate_report(results_dir, baseline_path=None, animate=True):
     results_dir = Path(results_dir)
     runs = {}  # (lam, alpha) -> data dict
     run_dirs = {}  # (lam, alpha) -> Path
@@ -887,29 +849,29 @@ def generate_report(results_dir, baseline_path=None):
 
     f = fig_learning_curves(runs, baseline_W)
     if f:
-        figs['learning_curves'] = _fig_to_b64(f)
+        figs['learning_curves'] = _fig_to_b64_util(f)
 
     f = fig_heatmap(runs, baseline_W)
     if f:
-        figs['heatmap'] = _fig_to_b64(f)
+        figs['heatmap'] = _fig_to_b64_util(f)
 
     f = fig_wnet_vs_lambda(runs, baseline_W)
     if f:
-        figs['wnet_vs_lambda'] = _fig_to_b64(f)
+        figs['wnet_vs_lambda'] = _fig_to_b64_util(f)
 
     f = fig_sigma_convergence(runs)
     if f:
-        figs['sigma'] = _fig_to_b64(f)
+        figs['sigma'] = _fig_to_b64_util(f)
 
     # Controller strategy (only if we have params)
     if best_params_flat is not None:
         f = fig_controller_strategy(best_params_flat, best_config)
         if f:
-            figs['ctrl_strategy'] = _fig_to_b64(f)
+            figs['ctrl_strategy'] = _fig_to_b64_util(f)
 
         f = fig_controller_budget_sensitivity(best_params_flat, best_config)
         if f:
-            figs['ctrl_budget'] = _fig_to_b64(f)
+            figs['ctrl_budget'] = _fig_to_b64_util(f)
 
     # Connectivity/J analysis (requires JAX simulation)
     j_sim = None
@@ -928,15 +890,119 @@ def generate_report(results_dir, baseline_path=None):
 
         f = fig_J_spatial(J_final, L, J_init, T_mean)
         if f:
-            figs['J_spatial'] = _fig_to_b64(f)
+            figs['J_spatial'] = _fig_to_b64_util(f)
 
         f = fig_J_histogram(J_final, J_init, T_mean)
         if f:
-            figs['J_hist'] = _fig_to_b64(f)
+            figs['J_hist'] = _fig_to_b64_util(f)
 
         f = fig_J_phase_portrait(J_bar, T_tr)
         if f:
-            figs['J_portrait'] = _fig_to_b64(f)
+            figs['J_portrait'] = _fig_to_b64_util(f)
+
+    # --- Interactive canvas chart (all training curves) ---
+    chart_series = []
+    for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
+        bh = data.get('best_fitness')
+        if bh is None or len(bh) == 0:
+            continue
+        chart_series.append({
+            'label': f'λ={lam:.2f} α={alpha:.2f}',
+            'x': list(range(len(bh))),
+            'y': [float(v) for v in bh],
+            'color': PALETTE[idx % len(PALETTE)],
+        })
+    interactive_curves_html = canvas_chart_html(
+        chart_series, 'exp1_curves',
+        title='Training Curves — W_net vs Generation (hover to inspect, click legend to toggle)',
+        xlabel='Generation', ylabel='W_net',
+        baseline=baseline_W,
+    )
+
+    # --- Per-run scenario selector panels ---
+    model_shared = None
+    try:
+        from evolving_ising.model import IsingModel
+        model_shared = IsingModel(
+            (best_config['L'], best_config['L']),
+            neighborhood=best_config['neighborhood'],
+            boundary=best_config['boundary'],
+        )
+    except Exception as _e:
+        print(f'  [warn] could not build IsingModel for animations: {_e}', file=sys.stderr)
+
+    scenario_ids = []
+    scenario_labels = []
+    scenario_panels = {}
+
+    for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
+        sid = f'sc_lam{lam:.2f}_alpha{alpha:.2f}'.replace('.', 'p')
+        label = f'λ={lam:.2f}, α={alpha:.2f}'
+        scenario_ids.append(sid)
+        scenario_labels.append(label)
+
+        run_dir = run_dirs.get((lam, alpha))
+        ctrl_data = None
+        if run_dir is not None:
+            cp = Path(run_dir) / 'best_controller.npz'
+            if cp.exists():
+                try:
+                    ctrl_data = np.load(cp)
+                except Exception:
+                    pass
+
+        run_config = {**best_config, 'lambda': lam, 'budget_alpha': alpha}
+        bh = data.get('best_fitness')
+        run_best_W = float(np.max(bh)) if bh is not None and len(bh) > 0 else float('nan')
+        cmp_str = ''
+        if baseline_W is not None and not np.isnan(run_best_W):
+            pct = 100.0 * (run_best_W - baseline_W) / (abs(baseline_W) + 1e-12)
+            cmp_str = f' ({pct:+.1f}% vs baseline)'
+
+        panel = f'<div class="run-panel">\n<h3>{label} — Best W_net: {run_best_W:.3f}{cmp_str}</h3>\n'
+
+        if ctrl_data is not None:
+            try:
+                f = fig_controller_strategy(ctrl_data['params'], run_config)
+                if f:
+                    panel += _img_tag(_fig_to_b64_util(f), 'Controller strategy',
+                                      caption='δJ heatmap: aligned (left) and anti-aligned (right) bonds. '
+                                              'Blue=strengthen, red=weaken. Ideal engine: strengthen during cold phase, weaken during hot.')
+            except Exception as _e:
+                print(f'  [warn] strategy fig {label}: {_e}', file=sys.stderr)
+
+            if model_shared is not None and animate:
+                try:
+                    print(f'  [info] animating {label}...', file=sys.stderr)
+                    sf, jf, _ = run_anim_frames(
+                        model_shared, run_config, 'bond',
+                        params_flat=ctrl_data['params'],
+                        n_cycles=2, steps_per_cycle=80, frame_skip=2,
+                    )
+                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+                    if gif_b64:
+                        panel += _gif_tag(gif_b64, 'Simulation animation',
+                                          caption='Spin state (left) and mean J per site (right) over 2 cycles. '
+                                                  'J structure emerges as the controller adapts bonds to the oscillating bath.')
+                except Exception as _e:
+                    print(f'  [warn] animation {label}: {_e}', file=sys.stderr)
+
+        panel += '</div>\n'
+        scenario_panels[sid] = panel
+
+    best_sid = f'sc_lam{best_lam:.2f}_alpha{best_alpha:.2f}'.replace('.', 'p')
+    if best_sid not in scenario_ids and scenario_ids:
+        best_sid = scenario_ids[0]
+
+    selector_html = ''
+    if scenario_ids:
+        selector_html = scenario_selector_html(scenario_ids, scenario_labels, best_sid,
+                                               title='Select Run')
+        for sid in scenario_ids:
+            display = 'block' if sid == best_sid else 'none'
+            selector_html += (f'<div id="{sid}" style="display:{display}" class="card">\n'
+                               + scenario_panels.get(sid, '')
+                               + '</div>\n')
 
     # --- Key results card ---
     baseline_str = f'{baseline_W:.4f}' if baseline_W is not None else 'N/A'
@@ -1114,7 +1180,7 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Experiment 1 — BondBudget Controller Report</title>
-  <style>{_CSS}</style>
+  <style>{_REPORT_CSS}</style>
 </head>
 <body>
 <h1>Experiment 1: Evolved Local Controller with BondBudget</h1>
@@ -1137,6 +1203,13 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
     '(2) early plateau (converged quickly) vs late improvement (slow landscape), '
     '(3) whether low λ runs converge faster and higher than high λ runs.'
 )}
+
+<h2>3b. Interactive Training Curves</h2>
+<div class="card">
+  <p>Hover over the chart to inspect values at any generation.
+     Click the coloured buttons to toggle individual runs on or off.</p>
+  {interactive_curves_html}
+</div>
 
 <h2>4. Performance Grid</h2>
 <div class="two-col">
@@ -1180,6 +1253,13 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
 
 {table_html}
 
+<h2>9. Per-Run Analysis</h2>
+<div class="card">
+  <p>Select a run from the dropdown to see its controller strategy heatmap
+     and a short simulation animation (spins + J coupling map).</p>
+  {selector_html}
+</div>
+
 </body>
 </html>
 """
@@ -1206,12 +1286,16 @@ def main():
         '--baseline-path', default='results/exp0/sweep.npz',
         help='Path to exp0 baseline .npz (default: results/exp0/sweep.npz)'
     )
+    parser.add_argument(
+        '--no-animate', action='store_true',
+        help='Skip GIF animation generation (faster report, no per-run animations)'
+    )
     args = parser.parse_args()
 
     results_dir   = Path(args.results_dir)
     baseline_path = Path(args.baseline_path) if args.baseline_path else None
 
-    generate_report(results_dir, baseline_path)
+    generate_report(results_dir, baseline_path, animate=not args.no_animate)
 
 
 if __name__ == '__main__':

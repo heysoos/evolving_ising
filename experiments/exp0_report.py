@@ -10,55 +10,27 @@ python experiments/exp0_report.py --results-dir results/exp0 --out results/exp0/
 """
 
 import argparse
-import base64
-import io
 import os
+import sys
 import datetime
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ── Unified CSS (see experiments/reports_formatting.md) ──────────────────────
-_CSS = """
-body {
-  font-family: Georgia, serif;
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 2em 2em 4em;
-  color: #1e2a3a;
-  background: #f8f9fb;
-  line-height: 1.75;
-}
-h1 { color: #1a3a5c; border-bottom: 3px solid #1a3a5c; padding-bottom: .4em;
-     font-size: 1.8em; margin-bottom: .3em; }
-h2 { color: #2c5282; margin-top: 2em; font-size: 1.25em;
-     border-left: 4px solid #3182ce; padding-left: .6em; }
-h3 { color: #2d3748; margin-top: 1.4em; font-size: 1.05em; }
-.card { background: #fff; border: 1px solid #d0d9e8; border-radius: 8px;
-        padding: 1.2em 1.6em; margin: 1em 0; box-shadow: 0 2px 6px rgba(0,0,0,.06); }
-.highlight { background: #ebf8ff; border-left: 4px solid #3182ce;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-.insight   { background: #f0fff4; border-left: 4px solid #276749;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-table { border-collapse: collapse; width: 100%; font-size: .88em; margin-top: .8em; }
-th { background: #2c5282; color: #fff; padding: 7px 12px; text-align: left; font-weight: 600; }
-td { padding: 6px 12px; border-bottom: 1px solid #e2e8f0; }
-tr:nth-child(even) td { background: #f7f9fc; }
-tr:hover td { background: #ebf8ff; }
-img.fig { max-width: 100%; border: 1px solid #d0d9e8; border-radius: 6px;
-          margin: .8em 0; box-shadow: 0 2px 8px rgba(0,0,0,.08); display: block; }
-.formula { font-family: 'Courier New', monospace; background: #f0f4f8;
-           border: 1px solid #d0d9e8; padding: .4em .8em; border-radius: 4px;
-           display: inline-block; margin: .3em 0; }
-.caption { font-style: italic; color: #4a5568; margin: -.4em 0 1.2em 0; font-size: .92em; }
-.pass { color: #276749; font-weight: bold; }
-.fail { color: #c53030; font-weight: bold; }
-.warn { color: #b7791f; font-weight: bold; }
-code { background: #edf2f7; padding: 2px 6px; border-radius: 3px;
-       font-size: .88em; font-family: 'Courier New', monospace; }
-.meta { color: #718096; font-size: .9em; }
-"""
+# Ensure project root and experiments/ are on the path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))
+from report_utils import (  # noqa: E402
+    REPORT_CSS as _CSS,
+    fig_to_b64 as _fig_to_b64,
+    run_anim_frames,
+    frames_to_gif_b64,
+    canvas_chart_html,
+    gif_tag as _gif_tag,
+)
+
 
 _EXPLANATION = """
 <h2>1. About This Experiment</h2>
@@ -98,12 +70,6 @@ _EXPLANATION = """
 </div>
 """
 
-
-def _fig_to_b64(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=130, bbox_inches='tight')
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
 
 
 def fig_heatmap(results):
@@ -190,7 +156,7 @@ def fig_scatter(results):
     return _fig_to_b64(fig)
 
 
-def generate_report(results_dir='results/exp0', out=None):
+def generate_report(results_dir='results/exp0', out=None, animate=True):
     npz_path = os.path.join(results_dir, 'sweep.npz')
     if not os.path.exists(npz_path):
         print(f'ERROR: {npz_path} not found. Run exp0_baseline.py first.')
@@ -225,6 +191,69 @@ def generate_report(results_dir='results/exp0', out=None):
         if caption:
             parts.append(f'<p class="caption">{caption}</p>')
         return '\n'.join(parts)
+
+    # --- Interactive canvas charts (J0 slice and tau slice) ---
+    W = results['W_net_grid']
+    J0_vals = results['J0_values']
+    tau_vals = results['tau_values']
+    best_idx = np.unravel_index(W.argmax(), W.shape)
+
+    j0_series = [{
+        'label': f'W_net vs J₀  (τ={int(tau_vals[best_idx[1]])})',
+        'x': [float(v) for v in J0_vals],
+        'y': [float(v) for v in W[:, best_idx[1]]],
+        'color': '#1f77b4',
+    }]
+    tau_series = [{
+        'label': f'W_net vs τ  (J₀={J0_vals[best_idx[0]]:.2f})',
+        'x': [float(v) for v in tau_vals],
+        'y': [float(v) for v in W[best_idx[0], :]],
+        'color': '#ff7f0e',
+    }]
+
+    j0_chart_html = canvas_chart_html(
+        j0_series, 'exp0_j0',
+        title='W_net vs J₀ at optimal τ (hover for exact values)',
+        xlabel='J₀', ylabel='W_net', width=620, height=260,
+    )
+    tau_chart_html = canvas_chart_html(
+        tau_series, 'exp0_tau',
+        title='W_net vs τ at optimal J₀ (hover for exact values)',
+        xlabel='τ', ylabel='W_net', width=620, height=260,
+    )
+
+    # --- Spin animation at optimal J0, tau (no controller) ---
+    anim_html = ''
+    if animate:
+        try:
+            from evolving_ising.model import IsingModel
+            anim_config = {
+                'L': 32, 'T_mean': 2.5, 'delta_T': 1.5,
+                'tau': float(tau_vals[best_idx[1]]),
+                'J_init': float(J0_vals[best_idx[0]]),
+                'J_min': 0.01, 'J_max': 5.0,
+                'steps_per_cycle': min(200, int(tau_vals[best_idx[1]])),
+                'bond_update_frac': 0.1, 'delta_J_max': 0.1, 'hidden_size': 8,
+                'mag_ema_alpha': 0.05, 'B_scale': 2.0, 'lambda': 0.0,
+                'neighborhood': 'von_neumann', 'boundary': 'periodic', 'num_sweeps': 1,
+            }
+            anim_model = IsingModel((32, 32))
+            print('  Animating spin dynamics at optimal (J₀, τ)...')
+            sf, jf, _ = run_anim_frames(
+                anim_model, anim_config, 'none',
+                params_flat=None, n_cycles=3, steps_per_cycle=80, frame_skip=2,
+            )
+            gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+            if gif_b64:
+                anim_html = _gif_tag(
+                    gif_b64, 'Spin dynamics at J₀_opt',
+                    caption=f'Spin state (left) and (constant) coupling map (right) '
+                            f'at J₀ = {J0_opt:.3f}, τ = {tau_opt}. '
+                            f'Watch domains form and dissolve as the temperature oscillates '
+                            f'through the critical point. No controller — J is fixed throughout.',
+                )
+        except Exception as _e:
+            print(f'  Warning: exp0 animation failed: {_e}')
 
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -267,8 +296,23 @@ def generate_report(results_dir='results/exp0', out=None):
 <h2>4. Slices at the Optimum</h2>
 {img('slices', 'Left: W_net vs J₀ at the optimal τ — the peak near J_c is the critical-point enhancement. Right: W_net vs τ at the optimal J₀ — intermediate τ values balance equilibration time against dissipation.')}
 
+<h2>4b. Interactive Slices</h2>
+<div class="card">
+  <p>Hover over either chart to read exact W_net values. The left chart holds τ fixed at its optimum; the right holds J₀ fixed.</p>
+  <div style="display:flex;flex-wrap:wrap;gap:1.5em;align-items:flex-start;">
+    <div>{j0_chart_html}</div>
+    <div>{tau_chart_html}</div>
+  </div>
+</div>
+
 <h2>5. W_net vs Entropy Production</h2>
 {img('scatter', 'Each point is one (J₀, τ) pair. High-work configurations tend to produce moderate entropy — extreme work extraction is always accompanied by some irreversibility.')}
+
+<h2>6. Spin Dynamics at Optimal Parameters</h2>
+<div class="card">
+  <p>Fixed-J simulation at J₀ = {J0_opt:.3f}, τ = {tau_opt}. Spin state (left) and coupling map (right, constant since J is fixed). Domains form during the cold phase and dissolve during the hot phase — this reversible sponge effect is what the adaptive controller in Experiments 1–3 must improve upon.</p>
+  {anim_html if anim_html else '<p class="caption">[Animation not generated — run without --no-animate to include]</p>'}
+</div>
 
 </body>
 </html>"""
@@ -285,5 +329,7 @@ if __name__ == '__main__':
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--results-dir', default='results/exp0')
     p.add_argument('--out', default=None)
+    p.add_argument('--no-animate', action='store_true',
+                   help='Skip spin animation at optimal parameters (faster)')
     args = p.parse_args()
-    generate_report(args.results_dir, args.out)
+    generate_report(args.results_dir, args.out, animate=not args.no_animate)

@@ -10,56 +10,29 @@ python experiments/exp2_report.py --results-dir results/exp2 --out results/exp2/
 """
 
 import argparse
-import base64
-import io
 import os
+import sys
 import datetime
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 
-# ── Unified CSS (see experiments/reports_formatting.md) ──────────────────────
-_CSS = """
-body {
-  font-family: Georgia, serif;
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 2em 2em 4em;
-  color: #1e2a3a;
-  background: #f8f9fb;
-  line-height: 1.75;
-}
-h1 { color: #1a3a5c; border-bottom: 3px solid #1a3a5c; padding-bottom: .4em;
-     font-size: 1.8em; margin-bottom: .3em; }
-h2 { color: #2c5282; margin-top: 2em; font-size: 1.25em;
-     border-left: 4px solid #3182ce; padding-left: .6em; }
-h3 { color: #2d3748; margin-top: 1.4em; font-size: 1.05em; }
-.card { background: #fff; border: 1px solid #d0d9e8; border-radius: 8px;
-        padding: 1.2em 1.6em; margin: 1em 0; box-shadow: 0 2px 6px rgba(0,0,0,.06); }
-.highlight { background: #ebf8ff; border-left: 4px solid #3182ce;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-.insight   { background: #f0fff4; border-left: 4px solid #276749;
-             border-radius: 0 6px 6px 0; padding: .7em 1.2em; margin: 1em 0; }
-table { border-collapse: collapse; width: 100%; font-size: .88em; margin-top: .8em; }
-th { background: #2c5282; color: #fff; padding: 7px 12px; text-align: left; font-weight: 600; }
-td { padding: 6px 12px; border-bottom: 1px solid #e2e8f0; }
-tr:nth-child(even) td { background: #f7f9fc; }
-tr:hover td { background: #ebf8ff; }
-img.fig { max-width: 100%; border: 1px solid #d0d9e8; border-radius: 6px;
-          margin: .8em 0; box-shadow: 0 2px 8px rgba(0,0,0,.08); display: block; }
-.formula { font-family: 'Courier New', monospace; background: #f0f4f8;
-           border: 1px solid #d0d9e8; padding: .4em .8em; border-radius: 4px;
-           display: inline-block; margin: .3em 0; }
-.caption { font-style: italic; color: #4a5568; margin: -.4em 0 1.2em 0; font-size: .92em; }
-.pass { color: #276749; font-weight: bold; }
-.fail { color: #c53030; font-weight: bold; }
-.warn { color: #b7791f; font-weight: bold; }
-code { background: #edf2f7; padding: 2px 6px; border-radius: 3px;
-       font-size: .88em; font-family: 'Courier New', monospace; }
-.meta { color: #718096; font-size: .9em; }
-"""
+# Ensure project root and experiments/ are on the path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))
+from report_utils import (  # noqa: E402
+    REPORT_CSS as _CSS,
+    fig_to_b64 as _fig_to_b64,
+    load_run as _load_run_util,
+    run_anim_frames,
+    frames_to_gif_b64,
+    canvas_chart_html,
+    scenario_selector_html,
+    gif_tag as _gif_tag,
+    PALETTE,
+)
 
 _EXPLANATION = """
 <h2>1. About This Experiment</h2>
@@ -101,31 +74,13 @@ _EXPLANATION = """
 """
 
 
-def _fig_to_b64(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=130, bbox_inches='tight')
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
-
-
-def _load_run(run_dir):
-    """Load training_log and best_controller from a run directory."""
-    log_path = os.path.join(run_dir, 'training_log.npz')
-    ctrl_path = os.path.join(run_dir, 'best_controller.npz')
-    if not os.path.exists(log_path):
-        return None, None
-    log = np.load(log_path)
-    ctrl = np.load(ctrl_path) if os.path.exists(ctrl_path) else None
-    return log, ctrl
-
-
 def fig_learning_curves(runs_gamma, gamma_values, baseline_W=11.86):
     """One subplot per gamma, W_net (best per gen) vs generation."""
     n = len(gamma_values)
     fig, axes = plt.subplots(1, n, figsize=(3.5 * n, 4), sharey=True)
     if n == 1:
         axes = [axes]
-    cmap = cm.get_cmap('viridis', n)
+    cmap = matplotlib.colormaps['viridis'].resampled(n)
 
     for ax, gamma, color in zip(axes, gamma_values, [cmap(i) for i in range(n)]):
         key = f'gamma_{gamma:.2f}'
@@ -191,28 +146,31 @@ def fig_controller_strategy(params_flat, config):
 
     T_norm_vals = np.linspace(-1, 1, 40)
     m_bar_vals  = np.linspace(-1, 1, 40)
-    TT, MM = np.meshgrid(T_norm_vals, m_bar_vals)
-
-    T_mean = config.get('T_mean', 2.5)
-    delta_T = config.get('delta_T', 1.5)
+    TT, MM = np.meshgrid(T_norm_vals, m_bar_vals)  # (40, 40)
+    n = 40 * 40
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    for ax, (s_prod, title) in zip(axes, [(+1, 'Aligned  (s_i·s_j = +1)'),
-                                           (-1, 'Anti-aligned  (s_i·s_j = −1)')]):
-        dJ = np.zeros((40, 40))
-        for ti, T_n in enumerate(T_norm_vals):
-            for mi, m_b in enumerate(m_bar_vals):
-                T_abs = T_mean + delta_T * T_n
-                bud_norm = 1.0
-                state = np.array([T_n, m_b, float(s_prod), float(s_prod * m_b), bud_norm])
-                dJ[mi, ti] = controller.forward(state)
+    # Controller inputs: [s_i, s_j, m_bar_i, T_norm, budget_norm]
+    for ax, (s_i_val, s_j_val, title) in zip(axes, [
+        (+1, +1, 'Aligned  (s_i=+1, s_j=+1)'),
+        (+1, -1, 'Anti-aligned  (s_i=+1, s_j=−1)'),
+    ]):
+        x = np.stack([
+            np.full(n, s_i_val, dtype=np.float32),
+            np.full(n, s_j_val, dtype=np.float32),
+            MM.ravel().astype(np.float32),
+            TT.ravel().astype(np.float32),
+            np.ones(n, dtype=np.float32),
+        ], axis=-1)  # (n, 5)
+        dJ = np.asarray(controller.forward(x)).ravel().reshape(40, 40)
+
         vmax = delta_J_max
         im = ax.imshow(dJ, origin='lower', aspect='auto',
                        extent=[T_norm_vals[0], T_norm_vals[-1], m_bar_vals[0], m_bar_vals[-1]],
                        cmap='RdBu_r', vmin=-vmax, vmax=vmax)
         fig.colorbar(im, ax=ax, label='δJ')
         ax.set_xlabel('T_norm  (−1 = cold, +1 = hot)')
-        ax.set_ylabel('m̄  (local magnetisation EMA)')
+        ax.set_ylabel('m̄_i  (local magnetisation EMA)')
         ax.set_title(title, fontsize=10)
         ax.axvline(0, color='k', lw=0.5, ls='--')
         ax.axhline(0, color='k', lw=0.5, ls='--')
@@ -231,9 +189,12 @@ def fig_J_spatial(best_controller_npz, config):
         return None
 
     L = config.get('L', 32)
-    J_init = config.get('J_init', config.get('T_mean', 2.5) / 2.269)
     T_mean = config.get('T_mean', 2.5)
+    J_init = config.get('J_init', T_mean / 2.269)
     J_c = T_mean / 2.269
+    J_min = config.get('J_min', 0.01)
+    J_max = config.get('J_max', 5.0)
+    alpha_ema = config.get('budget_alpha', 0.05)
 
     params_flat = best_controller_npz['params']
     delta_J_max = config.get('delta_J_max', 0.1)
@@ -243,34 +204,45 @@ def fig_J_spatial(best_controller_npz, config):
 
     model = IsingModel((L, L), neighborhood=config.get('neighborhood', 'von_neumann'),
                        boundary=config.get('boundary', 'periodic'))
-    neighbors = np.asarray(model.neighbors)
-    mask = np.asarray(model.mask, dtype=bool)
+    neighbors = np.asarray(model.neighbors)   # (N, K)
+    mask = np.asarray(model.mask, dtype=bool)  # (N, K)
     N, K = neighbors.shape
     J_nk = np.full((N, K), J_init, dtype=np.float32) * mask
 
+    # Flat bond index arrays for vectorized controller calls
+    bond_i = np.repeat(np.arange(N), K)   # (N*K,)
+    bond_j = neighbors.ravel()             # (N*K,)
+    bond_mask = mask.ravel()               # (N*K,)
+
     key = jax.random.PRNGKey(0)
-    spins = model.init_spins(key, 1)
+    spins = model.init_spins(key, 1)       # (1, N)
+    m_bar = np.zeros(N, dtype=np.float32)
 
     n_steps = 200
-    T_n_vals = np.sin(np.linspace(0, 2 * np.pi, n_steps))
+    T_norm_vals = np.sin(np.linspace(0, 2 * np.pi, n_steps))
     J_sum = np.zeros((N, K))
-    for T_n in T_n_vals:
-        m_bar = np.mean(np.asarray(spins[0]).astype(float))
-        for i in range(N):
-            for k in range(K):
-                if not mask[i, k]:
-                    continue
-                j = neighbors[i, k]
-                s_prod = float(np.asarray(spins[0, i])) * float(np.asarray(spins[0, j]))
-                bud = 1.0
-                state = np.array([T_n, m_bar, s_prod, s_prod * m_bar, bud])
-                dJ = controller.forward(state)
-                J_nk[i, k] = np.clip(J_nk[i, k] + dJ,
-                                     config.get('J_min', 0.01), config.get('J_max', 5.0))
+
+    for T_n in T_norm_vals:
+        spins_np = np.asarray(spins[0], dtype=np.float32)  # (N,)
+        m_bar = alpha_ema * spins_np + (1.0 - alpha_ema) * m_bar
+
+        # Build vectorized state: [s_i, s_j, m_bar_i, T_norm, budget_norm]
+        x = np.stack([
+            spins_np[bond_i],
+            spins_np[bond_j],
+            m_bar[bond_i],
+            np.full(N * K, T_n, dtype=np.float32),
+            np.ones(N * K, dtype=np.float32),
+        ], axis=-1)  # (N*K, 5)
+
+        dJ_all = np.asarray(controller.forward(x)).ravel()  # (N*K,)
+        dJ_nk = dJ_all.reshape(N, K)
+        J_nk = np.clip(J_nk + dJ_nk * mask, J_min, J_max)
         J_sum += J_nk
+
         key, sk = jax.random.split(key)
-        T_abs = T_mean + config.get('delta_T', 1.5) * T_n
-        spins, _ = model.metropolis_checkerboard_sweeps(sk, spins, jnp.array(J_nk), float(T_abs), 1)
+        T_abs = float(T_mean + config.get('delta_T', 1.5) * T_n)
+        spins, _ = model.metropolis_checkerboard_sweeps(sk, spins, jnp.array(J_nk), T_abs, 1)
 
     J_mean_site = (J_sum / n_steps * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1)
     J_map = J_mean_site.reshape(L, L)
@@ -297,7 +269,7 @@ def fig_J_spatial(best_controller_npz, config):
 
 
 def generate_report(results_dir='results/exp2', out=None,
-                    baseline_W=11.86, exp1_best=82.04):
+                    baseline_W=11.86, exp1_best=82.04, animate=True):
     if not os.path.isdir(results_dir):
         print(f'ERROR: {results_dir} not found. Run exp2_nbhd_budget.py first.')
         return
@@ -310,7 +282,7 @@ def generate_report(results_dir='results/exp2', out=None,
     for gamma in gamma_values:
         key = f'gamma_{gamma:.2f}'
         rd = os.path.join(results_dir, key)
-        log, ctrl = _load_run(rd)
+        log, ctrl = _load_run_util(rd)
         runs_gamma[key] = (log, ctrl)
 
     best_per_gamma = []
@@ -334,7 +306,7 @@ def generate_report(results_dir='results/exp2', out=None,
     for tau in tau_values:
         key = f'gamma_{best_gamma:.2f}_tau_{tau}'
         rd = os.path.join(results_dir, key)
-        log, ctrl = _load_run(rd)
+        log, ctrl = _load_run_util(rd)
         runs_tau[key] = (log, ctrl)
         if log is not None:
             best_per_tau.append(float(log['best_fitness'].max()))
@@ -386,6 +358,100 @@ def generate_report(results_dir='results/exp2', out=None,
             parts.append(f'<p class="caption">{caption}</p>')
         return '\n'.join(parts)
 
+    # --- Interactive canvas chart (gamma sweep training curves) ---
+    chart_series = []
+    for idx, gamma in enumerate(gamma_values):
+        key = f'gamma_{gamma:.2f}'
+        log, _ = runs_gamma.get(key, (None, None))
+        if log is None:
+            continue
+        bh = log['best_fitness']
+        chart_series.append({
+            'label': f'γ={gamma:.2f}',
+            'x': list(range(len(bh))),
+            'y': [float(v) for v in bh],
+            'color': PALETTE[idx % len(PALETTE)],
+        })
+    interactive_curves_html = canvas_chart_html(
+        chart_series, 'exp2_curves',
+        title='Training Curves — W_net vs Generation by γ (hover to inspect)',
+        xlabel='Generation', ylabel='W_net',
+        baseline=baseline_W,
+    )
+
+    # --- Per-gamma scenario panels ---
+    model_shared = None
+    try:
+        from evolving_ising.model import IsingModel
+        model_shared = IsingModel((config['L'], config['L']),
+                                  neighborhood=config.get('neighborhood', 'von_neumann'),
+                                  boundary=config.get('boundary', 'periodic'))
+    except Exception as _e:
+        print(f'  Warning: could not build model for animations: {_e}')
+
+    scenario_ids, scenario_labels, scenario_panels = [], [], {}
+    for idx, gamma in enumerate(gamma_values):
+        sid = f'sc_gamma{gamma:.2f}'.replace('.', 'p')
+        label = f'γ={gamma:.2f}'
+        scenario_ids.append(sid)
+        scenario_labels.append(label)
+
+        log, ctrl = runs_gamma.get(f'gamma_{gamma:.2f}', (None, None))
+        gamma_config = {**config, 'gamma': gamma, 'tau': 200,
+                        'steps_per_cycle': 200}
+
+        bh = log['best_fitness'] if log is not None else None
+        run_best_W = float(np.max(bh)) if bh is not None and len(bh) > 0 else float('nan')
+        cmp_str = ''
+        if not np.isnan(run_best_W):
+            pct = 100.0 * (run_best_W - baseline_W) / (abs(baseline_W) + 1e-12)
+            cmp_str = f' ({pct:+.1f}% vs Exp0 baseline)'
+
+        panel = f'<div class="run-panel">\n<h3>{label} — Best W_net: {run_best_W:.3f}{cmp_str}</h3>\n'
+
+        if ctrl is not None:
+            strat_b64 = None
+            try:
+                strat_b64 = fig_controller_strategy(ctrl['params'], gamma_config)
+            except Exception as _e:
+                print(f'  Warning: strategy {label}: {_e}')
+            if strat_b64:
+                panel += (f'<img class="fig" src="data:image/png;base64,{strat_b64}" alt="strategy">\n'
+                          f'<p class="caption">δJ heatmap: aligned (left) and anti-aligned (right) bonds. '
+                          f'Blue=strengthen, red=weaken.</p>\n')
+
+            if model_shared is not None and animate:
+                try:
+                    print(f'  Animating {label}...', flush=True)
+                    sf, jf, _ = run_anim_frames(
+                        model_shared, gamma_config, 'neighbourhood',
+                        params_flat=ctrl['params'],
+                        n_cycles=2, steps_per_cycle=80, frame_skip=2,
+                    )
+                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+                    if gif_b64:
+                        panel += _gif_tag(gif_b64, 'Simulation animation',
+                                          caption='Spin state (left) and mean J per site (right) over 2 cycles '
+                                                  f'with neighbourhood budget (γ={gamma:.2f}).')
+                except Exception as _e:
+                    print(f'  Warning: animation {label}: {_e}')
+
+        panel += '</div>\n'
+        scenario_panels[sid] = panel
+
+    best_sid = f'sc_gamma{best_gamma:.2f}'.replace('.', 'p')
+    if best_sid not in scenario_ids and scenario_ids:
+        best_sid = scenario_ids[0]
+
+    selector_html = ''
+    if scenario_ids:
+        selector_html = scenario_selector_html(scenario_ids, scenario_labels, best_sid,
+                                               title='Select γ Run')
+        for sid in scenario_ids:
+            display = 'block' if sid == best_sid else 'none'
+            selector_html += (f'<div id="{sid}" style="display:{display}" class="card">\n'
+                               + scenario_panels.get(sid, '') + '</div>\n')
+
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
     # Results table
@@ -427,6 +493,12 @@ def generate_report(results_dir='results/exp2', out=None,
 <h2>3. Learning Curves</h2>
 {img('curves', 'W_net (best-ever and generation mean, shaded) vs generation for each γ value. Dashed red line is the Exp0 fixed-J ceiling. Runs that converge above the baseline demonstrate genuine advantage from neighbourhood budget sharing.')}
 
+<h2>3b. Interactive Training Curves</h2>
+<div class="card">
+  <p>Hover to inspect values at any generation. Click buttons to toggle individual γ runs.</p>
+  {interactive_curves_html}
+</div>
+
 <h2>4. W_net vs γ</h2>
 {img('gamma_sweep', 'Best W_net achieved (across 500 generations) for each γ. The green bar marks the optimal γ*. A non-monotonic pattern (peak at intermediate γ) would confirm the spatial-correlation hypothesis.')}
 
@@ -443,6 +515,12 @@ def generate_report(results_dir='results/exp2', out=None,
 
 <h2>7. Connectivity Analysis</h2>
 {img('j_spatial', 'Left: spatial map of time-averaged coupling strength J per site. Heterogeneous patterns indicate the controller has learned spatially structured strategies rather than uniform rescaling. Right: distribution of final J values; markers indicate J_init (grey) and J_c = T_mean/2.269 (red).')}
+
+<h2>8. Per-γ Analysis</h2>
+<div class="card">
+  <p>Select a γ value to see its controller strategy heatmap and a short simulation animation.</p>
+  {selector_html}
+</div>
 
 </body>
 </html>"""
@@ -463,5 +541,8 @@ if __name__ == '__main__':
                    help='Exp0 W_net_opt to use as baseline (default: 11.86)')
     p.add_argument('--exp1-best', type=float, default=82.04,
                    help='Best W_net from Exp1 (default: 82.04)')
+    p.add_argument('--no-animate', action='store_true',
+                   help='Skip GIF animation generation (faster, no per-γ animations)')
     args = p.parse_args()
-    generate_report(args.results_dir, args.out, args.baseline_W, args.exp1_best)
+    generate_report(args.results_dir, args.out, args.baseline_W, args.exp1_best,
+                    animate=not args.no_animate)
