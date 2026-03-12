@@ -20,7 +20,7 @@ from work_extraction.thermodynamics import run_cycles_jax
 from work_extraction.train import DEFAULT_CONFIG
 
 
-def run_baseline_sweep(config=None, results_dir='results/exp0'):
+def run_baseline_sweep(config=None, results_dir='../results/exp0'):
     """Run the baseline J0 × tau sweep using JAX vmap + nested lax.scan.
 
     All J0 values are evaluated in parallel via jax.vmap.  A single
@@ -45,10 +45,10 @@ def run_baseline_sweep(config=None, results_dir='results/exp0'):
 
     T_mean        = cfg['T_mean']
     delta_T       = cfg['delta_T']
-    n_cycles      = 50
-    num_sweeps    = cfg['num_sweeps']  # Python int — static (scan unrolling)
-    warmup_sweeps = 500                # Python int — static (single GPU call)
-    batch_size    = 40
+    n_cycles      = 50  # cfg['n_eval_cycles'] * 5
+    num_sweeps    = cfg['num_sweeps']    # Python int — static (scan unrolling)
+    warmup_sweeps = cfg['warmup_sweeps'] # Python int — static (single GPU call)
+    batch_size    = 40  # cfg['n_eval_chains'] * 8
 
     mask_f = jnp.array(model.mask, dtype=jnp.float32)
     J0_jax = jnp.array(J0_values, dtype=jnp.float32)

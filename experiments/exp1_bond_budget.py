@@ -13,7 +13,7 @@ import numpy as np
 from work_extraction.train import run_experiment, DEFAULT_CONFIG
 
 
-def run_exp1(config=None, results_dir='results/exp1', n_generations=500):
+def run_exp1(config=None, results_dir='../results/exp1', n_generations=500):
     """Run Experiment 1: Bond Budget sweep."""
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
@@ -52,4 +52,4 @@ def run_exp1(config=None, results_dir='results/exp1', n_generations=500):
 
 
 if __name__ == '__main__':
-    run_exp1()
+    run_exp1(results_dir='../results/exp1_batched')

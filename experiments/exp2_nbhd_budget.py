@@ -13,7 +13,7 @@ from work_extraction.train import run_experiment, DEFAULT_CONFIG
 
 
 def run_exp2(best_lambda=0.01, best_alpha=0.1, config=None,
-             results_dir='results/exp2', n_generations=500):
+             results_dir='../results/exp2', n_generations=500):
     """Run Experiment 2: Neighbourhood Budget sweep."""
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
