@@ -26,6 +26,8 @@ from report_utils import (  # noqa: E402
     REPORT_CSS as _CSS,
     fig_to_b64 as _fig_to_b64,
     load_run as _load_run_util,
+    load_config,
+    config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
     canvas_chart_html,
@@ -423,15 +425,17 @@ def generate_report(results_dir='results/exp2', out=None,
             if model_shared is not None and animate:
                 try:
                     print(f'  Animating {label}...', flush=True)
-                    sf, jf, _ = run_anim_frames(
+                    sf, jf, _, wt = run_anim_frames(
                         model_shared, gamma_config, 'neighbourhood',
                         params_flat=ctrl['params'],
-                        n_cycles=2, steps_per_cycle=80, frame_skip=2,
+                        n_cycles=10, steps_per_cycle=80, frame_skip=4,
                     )
-                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
+                                                wnet_trace=wt)
                     if gif_b64:
                         panel += _gif_tag(gif_b64, 'Simulation animation',
-                                          caption='Spin state (left) and mean J per site (right) over 2 cycles '
+                                          caption='Spin state (left), mean J per site (right), '
+                                                  'and cumulative W_net trace (bottom) over 10 cycles '
                                                   f'with neighbourhood budget (γ={gamma:.2f}).')
                 except Exception as _e:
                     print(f'  Warning: animation {label}: {_e}')
@@ -453,6 +457,9 @@ def generate_report(results_dir='results/exp2', out=None,
                                + scenario_panels.get(sid, '') + '</div>\n')
 
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    cfg = load_config(os.path.join(results_dir, best_run_key)) or {}
+    config_html = config_table_html(cfg, title='Best-Run Configuration')
 
     # Results table
     rows = ''
@@ -521,6 +528,9 @@ def generate_report(results_dir='results/exp2', out=None,
   <p>Select a γ value to see its controller strategy heatmap and a short simulation animation.</p>
   {selector_html}
 </div>
+
+<h2>9. Configuration</h2>
+{config_html if config_html else '<p class="caption">[config.json not found — re-run exp2 to generate]</p>'}
 
 </body>
 </html>"""

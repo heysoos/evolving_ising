@@ -8,6 +8,7 @@ Outputs: results/exp0/sweep.npz, figures/exp0_heatmap.png
 """
 
 import os
+import json
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -45,10 +46,10 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
 
     T_mean        = cfg['T_mean']
     delta_T       = cfg['delta_T']
-    n_cycles      = 50  # cfg['n_eval_cycles'] * 5
+    n_cycles      = cfg['n_eval_cycles'] * 5
     num_sweeps    = cfg['num_sweeps']    # Python int — static (scan unrolling)
     warmup_sweeps = cfg['warmup_sweeps'] # Python int — static (single GPU call)
-    batch_size    = 40  # cfg['n_eval_chains'] * 8
+    batch_size    = cfg['n_eval_chains'] * 8
 
     mask_f = jnp.array(model.mask, dtype=jnp.float32)
     J0_jax = jnp.array(J0_values, dtype=jnp.float32)
@@ -122,6 +123,24 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
         tau_opt=tau_opt,
         W_net_opt=W_net_opt,
     )
+
+    config_save = {
+        k: (v.item() if hasattr(v, 'item') else v)
+        for k, v in cfg.items()
+        if isinstance(v, (int, float, str, bool)) or hasattr(v, 'item')
+    }
+    config_save.update({
+        'J0_min': float(J0_values[0]),
+        'J0_max': float(J0_values[-1]),
+        'J0_n': len(J0_values),
+        'tau_min': int(tau_values[0]),
+        'tau_max': int(tau_values[-1]),
+        'tau_n': len(tau_values),
+        'batch_size': batch_size,
+        'n_cycles': n_cycles,
+    })
+    with open(os.path.join(results_dir, 'config.json'), 'w') as _f:
+        json.dump(config_save, _f, indent=2)
 
     return {
         'J0_values': J0_values,

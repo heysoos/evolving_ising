@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from report_utils import (  # noqa: E402
     REPORT_CSS as _CSS,
     fig_to_b64 as _fig_to_b64,
+    load_config,
+    config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
     canvas_chart_html,
@@ -67,6 +69,22 @@ _EXPLANATION = """
   <p>τ sets the oscillation period. Very fast oscillations (small τ) do not allow the
   spin system to equilibrate; very slow ones dissipate more entropy. The optimum lies
   somewhere in between.</p>
+</div>
+<div class="card">
+  <h3>How is Entropy Production Measured?</h3>
+  <p>At each Metropolis step the system exchanges heat δQ = δE = E(t+1) − E(t) with the
+  bath at instantaneous temperature T(t). By the Clausius inequality the entropy
+  produced per step is:</p>
+  <p class="formula">δΣ = −δE / T(t)</p>
+  <p>Summing over one full cycle (a cyclic process returns the spin state to its
+  stationary distribution, so ΔS<sub>system</sub> = 0 per cycle) gives the cycle
+  entropy production:</p>
+  <p class="formula">Σ<sub>cycle</sub> = −Σ<sub>t</sub> δE<sub>t</sub> / T(t)
+    = Q<sub>out</sub>/T<sub>cold</sub> − Q<sub>in</sub>/T<sub>hot</sub></p>
+  <p>Σ<sub>cycle</sub> ≥ 0 always (second law). A perfect Carnot engine would
+  have Σ<sub>cycle</sub> = 0, but real Metropolis dynamics are irreversible, so
+  Σ<sub>cycle</sub> &gt; 0. Large Σ means the process is far from equilibrium and
+  dissipating a lot of free energy without extracting proportional work.</p>
 </div>
 """
 
@@ -176,13 +194,15 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
     figs = {}
     for key, fn, args in [
         ('heatmap', fig_heatmap, (results,)),
-        ('slices',  fig_slices,  (results,)),
         ('scatter', fig_scatter, (results,)),
     ]:
         try:
             figs[key] = fn(*args)
         except Exception as e:
             print(f'  Warning: figure {key} failed: {e}')
+
+    cfg = load_config(results_dir) or {}
+    config_html = config_table_html(cfg, title='Sweep Configuration')
 
     def img(key, caption=''):
         if key not in figs:
@@ -239,18 +259,19 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
             }
             anim_model = IsingModel((32, 32))
             print('  Animating spin dynamics at optimal (J₀, τ)...')
-            sf, jf, _ = run_anim_frames(
+            sf, jf, _, wt = run_anim_frames(
                 anim_model, anim_config, 'none',
-                params_flat=None, n_cycles=3, steps_per_cycle=80, frame_skip=2,
+                params_flat=None, n_cycles=10, steps_per_cycle=80, frame_skip=4,
             )
-            gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+            gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200, wnet_trace=wt)
             if gif_b64:
                 anim_html = _gif_tag(
                     gif_b64, 'Spin dynamics at J₀_opt',
-                    caption=f'Spin state (left) and (constant) coupling map (right) '
+                    caption=f'Spin state (left), coupling map (right, constant since J is fixed), '
+                            f'and cumulative W_net trace (bottom) '
                             f'at J₀ = {J0_opt:.3f}, τ = {tau_opt}. '
-                            f'Watch domains form and dissolve as the temperature oscillates '
-                            f'through the critical point. No controller — J is fixed throughout.',
+                            f'Domains form during the cold phase and dissolve during the hot phase. '
+                            f'No controller — J is fixed throughout.',
                 )
         except Exception as _e:
             print(f'  Warning: exp0 animation failed: {_e}')
@@ -293,10 +314,7 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
 <h2>3. W_net and Entropy Heatmaps</h2>
 {img('heatmap', 'Left: net extracted work W_net across the J₀ × τ parameter grid. Right: entropy production Σ_cycle. The white dashed line marks J_c = T_mean/2.269; the red star marks the optimum.')}
 
-<h2>4. Slices at the Optimum</h2>
-{img('slices', 'Left: W_net vs J₀ at the optimal τ — the peak near J_c is the critical-point enhancement. Right: W_net vs τ at the optimal J₀ — intermediate τ values balance equilibration time against dissipation.')}
-
-<h2>4b. Interactive Slices</h2>
+<h2>4. Interactive Slices</h2>
 <div class="card">
   <p>Hover over either chart to read exact W_net values. The left chart holds τ fixed at its optimum; the right holds J₀ fixed.</p>
   <div style="display:flex;flex-wrap:wrap;gap:1.5em;align-items:flex-start;">
@@ -310,9 +328,12 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
 
 <h2>6. Spin Dynamics at Optimal Parameters</h2>
 <div class="card">
-  <p>Fixed-J simulation at J₀ = {J0_opt:.3f}, τ = {tau_opt}. Spin state (left) and coupling map (right, constant since J is fixed). Domains form during the cold phase and dissolve during the hot phase — this reversible sponge effect is what the adaptive controller in Experiments 1–3 must improve upon.</p>
+  <p>Fixed-J simulation at J₀ = {J0_opt:.3f}, τ = {tau_opt}. Spin state (left), coupling map (right, constant since J is fixed), and cumulative W_net trace (bottom). Domains form during the cold phase and dissolve during the hot phase — this reversible sponge effect is what the adaptive controller in Experiments 1–3 must improve upon.</p>
   {anim_html if anim_html else '<p class="caption">[Animation not generated — run without --no-animate to include]</p>'}
 </div>
+
+<h2>7. Configuration</h2>
+{config_html if config_html else '<p class="caption">[config.json not found — re-run exp0_baseline.py to generate]</p>'}
 
 </body>
 </html>"""

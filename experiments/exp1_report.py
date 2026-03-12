@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from report_utils import (  # noqa: E402
     REPORT_CSS as _REPORT_CSS,
     fig_to_b64 as _fig_to_b64_util,
+    load_config,
+    config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
     canvas_chart_html,
@@ -974,15 +976,17 @@ def generate_report(results_dir, baseline_path=None, animate=True):
             if model_shared is not None and animate:
                 try:
                     print(f'  [info] animating {label}...', file=sys.stderr)
-                    sf, jf, _ = run_anim_frames(
+                    sf, jf, _, wt = run_anim_frames(
                         model_shared, run_config, 'bond',
                         params_flat=ctrl_data['params'],
-                        n_cycles=2, steps_per_cycle=80, frame_skip=2,
+                        n_cycles=10, steps_per_cycle=80, frame_skip=4,
                     )
-                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=150)
+                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
+                                                wnet_trace=wt)
                     if gif_b64:
                         panel += _gif_tag(gif_b64, 'Simulation animation',
-                                          caption='Spin state (left) and mean J per site (right) over 2 cycles. '
+                                          caption='Spin state (left), mean J per site (right), '
+                                                  'and cumulative W_net trace (bottom) over 10 cycles. '
                                                   'J structure emerges as the controller adapts bonds to the oscillating bath.')
                 except Exception as _e:
                     print(f'  [warn] animation {label}: {_e}', file=sys.stderr)
@@ -1003,6 +1007,10 @@ def generate_report(results_dir, baseline_path=None, animate=True):
             selector_html += (f'<div id="{sid}" style="display:{display}" class="card">\n'
                                + scenario_panels.get(sid, '')
                                + '</div>\n')
+
+    # --- Config ---
+    cfg = load_config(best_run_dir) if best_run_dir is not None else None
+    config_html = config_table_html(cfg, title='Best-Run Configuration') if cfg else ''
 
     # --- Key results card ---
     baseline_str = f'{baseline_W:.4f}' if baseline_W is not None else 'N/A'
@@ -1252,6 +1260,8 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
 {j_section}
 
 {table_html}
+
+{config_html}
 
 <h2>9. Per-Run Analysis</h2>
 <div class="card">

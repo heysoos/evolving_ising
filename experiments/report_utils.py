@@ -111,6 +111,32 @@ def gif_tag(b64, alt='', caption=''):
     return '\n'.join(parts)
 
 
+def load_config(run_dir):
+    """Load config.json from a run directory.  Returns dict or None."""
+    import json as _json
+    from pathlib import Path
+    p = Path(run_dir) / 'config.json'
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return _json.load(f)
+
+
+def config_table_html(config, title='Configuration'):
+    """Render a config dict as an HTML table card."""
+    if not config:
+        return ''
+    rows = ''.join(
+        f'<tr><td><code>{k}</code></td><td>{v}</td></tr>'
+        for k, v in sorted(config.items())
+    )
+    return (
+        f'<div class="card">\n<h3>{title}</h3>\n'
+        f'<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table>\n</div>\n'
+    )
+
+
 def load_run(run_dir):
     """Load training_log.npz and best_controller.npz from a run directory.
 
@@ -177,6 +203,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     spin_frames : list of (L, L) int8 arrays
     J_mean_frames : list of (L, L) float32 arrays  (mean J strength per site)
     W_net_cycles : list of floats
+    wnet_trace : list of floats  (cumulative W_net at each captured frame)
     """
     import jax
     import jax.numpy as jnp
@@ -227,6 +254,8 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     spin_frames = []
     J_mean_frames = []
     W_net_cycles = []
+    wnet_trace = []
+    running_wnet = 0.0
     rng = np.random.RandomState(0)
 
     t_global = 0
@@ -246,6 +275,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
             dE = E_now - E_prev
             Q_in += max(0.0, dE)
             Q_out += max(0.0, -dE)
+            running_wnet += max(0.0, -dE) - max(0.0, dE)
             E_prev = E_now
 
             budget.update(spins_bef_f, spins_aft_f, J_nk, T_t)
@@ -285,22 +315,31 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
                     J_init,
                 )
                 J_mean_frames.append(J_mean.reshape(L, L).astype(np.float32).copy())
+                wnet_trace.append(running_wnet)
 
             t_global += 1
 
         W_net_cycles.append(Q_out - Q_in)
 
-    return spin_frames, J_mean_frames, W_net_cycles
+    return spin_frames, J_mean_frames, W_net_cycles, wnet_trace
 
 
 # ---------------------------------------------------------------------------
 # GIF generation
 # ---------------------------------------------------------------------------
 
-def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5):
+def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5,
+                      wnet_trace=None):
     """Render spin + J frames to an animated GIF using PIL; return base64 string or None.
 
-    Each GIF frame is a side-by-side panel: spin state (left) and mean J/site (right).
+    Each GIF frame has two rows:
+      Top: spin state (left) | mean J per site (right)
+      Bottom (optional): cumulative W_net trace with a moving cursor
+
+    Parameters
+    ----------
+    wnet_trace : list of floats or None
+        Cumulative W_net at each frame. If provided, a trace strip is added.
     """
     if not HAS_PIL:
         print('  Pillow not installed; skipping GIF (pip install pillow)')
@@ -313,26 +352,64 @@ def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5
     step = max(1, len(spin_frames) // max_frames)
     sf = spin_frames[::step]
     jf = J_mean_frames[::step]
+    wt = wnet_trace[::step] if wnet_trace is not None else None
 
     J_arr = np.stack(jf)
     j_vmin, j_vmax = float(J_arr.min()), float(J_arr.max())
     if j_vmax <= j_vmin:
         j_vmax = j_vmin + 0.01
 
-    cmap = plt.get_cmap('viridis')
+    cmap = matplotlib.colormaps['viridis']
+    L = sf[0].shape[0]
+    strip_h = L // 2  # height of W_net strip (pre-scale)
 
+    # Pre-compute W_net trace bounds for consistent scaling across all frames
+    if wt is not None and len(wt) > 1:
+        wt_arr = np.array(wt, dtype=np.float64)
+        w_vmin = float(min(wt_arr.min(), 0.0))
+        w_vmax = float(max(wt_arr.max(), w_vmin + 1.0))
+    else:
+        wt = None  # disable trace panel if too short
+
+    def _render_wnet_strip(frame_idx, n_total, strip_width):
+        """Render cumulative W_net trace as an RGB numpy strip."""
+        strip = np.full((strip_h, strip_width, 3), 28, dtype=np.uint8)  # dark bg
+        if wt is None:
+            return strip
+        # Draw zero line
+        y_zero = int((1.0 - (0.0 - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
+        y_zero = max(0, min(y_zero, strip_h - 1))
+        strip[y_zero, :] = [80, 80, 80]
+        # Draw trace up to current frame
+        for i in range(frame_idx + 1):
+            x = int(i / n_total * strip_width)
+            x = min(x, strip_width - 1)
+            y = int((1.0 - (wt_arr[i] - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
+            y = max(0, min(y, strip_h - 1))
+            strip[y, x] = [80, 200, 120]  # green trace
+        # Draw vertical cursor at current frame
+        x_cur = int(frame_idx / n_total * strip_width)
+        x_cur = min(x_cur, strip_width - 1)
+        strip[:, x_cur] = [200, 80, 80]  # red cursor
+        return strip
+
+    n_frames = len(sf)
     pil_frames = []
-    for s, j in zip(sf, jf):
-        # Left panel: spin state (dark grey = -1, light grey = +1)
+    for frame_idx, (s, j) in enumerate(zip(sf, jf)):
+        # Top row: spin (left) | J map (right)
         spin_rgb = np.where(s[:, :, np.newaxis] > 0, 220, 30).astype(np.uint8)
         spin_rgb = np.broadcast_to(spin_rgb, (*s.shape, 3)).copy()
 
-        # Right panel: J map via viridis colormap
         j_norm = np.clip((j - j_vmin) / (j_vmax - j_vmin), 0.0, 1.0)
         j_rgb = (cmap(j_norm)[:, :, :3] * 255).astype(np.uint8)
 
-        # Combine side-by-side
-        combined = np.concatenate([spin_rgb, j_rgb], axis=1)  # (L, 2L, 3)
+        top = np.concatenate([spin_rgb, j_rgb], axis=1)  # (L, 2L, 3)
+
+        if wt is not None:
+            bottom = _render_wnet_strip(frame_idx, n_frames, top.shape[1])
+            combined = np.concatenate([top, bottom], axis=0)  # (L + strip_h, 2L, 3)
+        else:
+            combined = top
 
         img = _PILImage.fromarray(combined, mode='RGB')
         H, W = combined.shape[:2]
@@ -531,7 +608,7 @@ def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run')
         for sid, lbl in zip(scenario_ids, labels)
     )
     hide_all = ';'.join(
-        f'document.getElementById("{s}").style.display="none"'
+        f"document.getElementById('{s}').style.display='none'"
         for s in scenario_ids
     )
     return (

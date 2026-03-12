@@ -5,6 +5,7 @@ Wires together IsingModel, controller, budget, and WorkExtractionES.
 
 import os
 import sys
+import json
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ from evolving_ising.model import IsingModel
 from .thermodynamics import temperature_schedule
 from .controller import LocalController
 from .budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
-from .optimiser import WorkExtractionES, evaluate_fitness, make_jax_eval_fn
+from .optimiser import WorkExtractionES, make_jax_eval_fn
 
 
 DEFAULT_CONFIG = {
@@ -30,6 +31,7 @@ DEFAULT_CONFIG = {
     'J_max': 5.0,
     'n_generations': 500,
     'n_eval_cycles': 10,
+    'n_eval_chains': 5,
     'steps_per_cycle': 200,
     'bond_update_frac': 0.1,
     'delta_J_max': 0.1,
@@ -45,6 +47,7 @@ DEFAULT_CONFIG = {
     'neighborhood': 'von_neumann',
     'boundary': 'periodic',
     'num_sweeps': 1,
+    'warmup_sweeps': 500,
 }
 
 
@@ -123,8 +126,21 @@ def run_experiment(config, budget_type='none', name='experiment',
         boundary=cfg['boundary'],
     )
 
-    # Build JAX eval function and batched vmap version
-    eval_fn = make_jax_eval_fn(model, cfg, budget_type)
+    # Build JAX eval function.
+    # If n_eval_chains > 1, average fitness over that many independent spin-chain
+    # runs per candidate.  The inner vmap over chains and the outer vmap over the
+    # population are fused by JAX into a single kernel of pop_size × n_eval_chains
+    # concurrent evaluations.
+    n_eval_chains = int(cfg.get('n_eval_chains', 1))
+    eval_fn_base = make_jax_eval_fn(model, cfg, budget_type)
+
+    if n_eval_chains > 1:
+        def eval_fn(params_flat, key):
+            chain_keys = jax.random.split(key, n_eval_chains)
+            return jnp.mean(jax.vmap(lambda k: eval_fn_base(params_flat, k))(chain_keys))
+    else:
+        eval_fn = eval_fn_base
+
     eval_batch = jax.jit(jax.vmap(eval_fn))
 
     # Determine n_params from controller (same MLP architecture)
@@ -224,5 +240,13 @@ def run_experiment(config, budget_type='none', name='experiment',
         os.path.join(save_dir, 'best_controller.npz'),
         params=result.best_params,
     )
+
+    config_serializable = {
+        k: (v.item() if hasattr(v, 'item') else v)
+        for k, v in cfg.items()
+        if isinstance(v, (int, float, str, bool)) or hasattr(v, 'item')
+    }
+    with open(os.path.join(save_dir, 'config.json'), 'w') as _f:
+        json.dump(config_serializable, _f, indent=2)
 
     return result
