@@ -259,16 +259,17 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
             }
             anim_model = IsingModel((32, 32))
             print('  Animating spin dynamics at optimal (J₀, τ)...')
-            sf, jf, _, wt = run_anim_frames(
+            sf, jf, _, wt, tt, _ = run_anim_frames(
                 anim_model, anim_config, 'none',
                 params_flat=None, n_cycles=10, steps_per_cycle=80, frame_skip=4,
             )
-            gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200, wnet_trace=wt)
+            gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
+                                         wnet_trace=wt, T_trace=tt)
             if gif_b64:
                 anim_html = _gif_tag(
                     gif_b64, 'Spin dynamics at J₀_opt',
-                    caption=f'Spin state (left), coupling map (right, constant since J is fixed), '
-                            f'and cumulative W_net trace (bottom) '
+                    caption=f'Spin state (left), mean J (right, constant since J is fixed), '
+                            f'cumulative W_net (3rd panel), bath temperature T(t) (bottom) '
                             f'at J₀ = {J0_opt:.3f}, τ = {tau_opt}. '
                             f'Domains form during the cold phase and dissolve during the hot phase. '
                             f'No controller — J is fixed throughout.',

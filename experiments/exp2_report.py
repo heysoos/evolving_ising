@@ -425,18 +425,19 @@ def generate_report(results_dir='results/exp2', out=None,
             if model_shared is not None and animate:
                 try:
                     print(f'  Animating {label}...', flush=True)
-                    sf, jf, _, wt = run_anim_frames(
+                    sf, jf, _, wt, tt, bf = run_anim_frames(
                         model_shared, gamma_config, 'neighbourhood',
                         params_flat=ctrl['params'],
                         n_cycles=10, steps_per_cycle=80, frame_skip=4,
                     )
                     gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
-                                                wnet_trace=wt)
+                                                wnet_trace=wt, T_trace=tt,
+                                                bud_frames=bf)
                     if gif_b64:
                         panel += _gif_tag(gif_b64, 'Simulation animation',
-                                          caption='Spin state (left), mean J per site (right), '
-                                                  'and cumulative W_net trace (bottom) over 10 cycles '
-                                                  f'with neighbourhood budget (γ={gamma:.2f}).')
+                                          caption='Spin state (left), mean J (centre), per-site budget (right), '
+                                                  'cumulative W_net and bath temperature T(t) below, '
+                                                  f'over 10 cycles with neighbourhood budget (γ={gamma:.2f}).')
                 except Exception as _e:
                     print(f'  Warning: animation {label}: {_e}')
 

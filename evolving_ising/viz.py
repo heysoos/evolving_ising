@@ -332,6 +332,141 @@ def plot_connectivity(
     return fig_to_base64(fig)
 
 
+def plot_directional_flows(
+    J_nk:      np.ndarray,   # (N, K) float32
+    mask:      np.ndarray,   # (N, K) bool
+    neighbors: np.ndarray,   # (N, K) int32
+    T_final:   np.ndarray,   # (N,) float32
+    S_final:   np.ndarray,   # (N,) int8 or float32
+    H: int,
+    W: int,
+    hot_t: float,
+    cold_t: float,
+    title: str,
+) -> str:
+    """
+    Three-panel directional flow visualisation of the evolved coupling structure.
+
+    Panel A — Heat Flux
+        Per-site heat flux vector q_i = Σ_k W_norm[i,k] · ΔT[i,k] · d̂_k,
+        overlaid on the final temperature field.  Arrows show *where* heat
+        is actively flowing and in which direction; coloured by flux magnitude.
+
+    Panel B — Conductance Asymmetry (Bond Diodes)
+        ΔW[i,k] = |J[i,k]| − |J[j, rev_k]|.  A positive value means the
+        bond is stronger in the forward direction — a thermal rectifier.
+        Background: net asymmetry scalar per site (RdBu_r, centred at 0).
+        Arrows: net diode direction per site, coloured by asymmetry magnitude.
+
+    Panel C — Spin Alignment Current
+        f[i,k] = J[i,k] · s_i · s_j.  Positive = aligned spins sharing a
+        ferromagnetic bond (order being exported in that direction).
+        Background: spin configuration (gray).
+        Arrows: net direction of spin-order propagation per site.
+
+    Returns
+    -------
+    str  base64-encoded PNG
+    """
+    N, K = J_nk.shape
+
+    # ── Bond direction vectors ────────────────────────────────────────────────
+    i_row = (np.arange(N) // W)[:, None].astype(np.float32)  # (N, 1)
+    i_col = (np.arange(N) % W)[:, None].astype(np.float32)   # (N, 1)
+    j_row = (neighbors // W).astype(np.float32)               # (N, K)
+    j_col = (neighbors % W).astype(np.float32)                # (N, K)
+
+    d_row = j_row - i_row   # positive = downward
+    d_col = j_col - i_col   # positive = rightward
+
+    # Periodic wrap correction
+    d_row = np.where(d_row >  H / 2, d_row - H, d_row)
+    d_row = np.where(d_row < -H / 2, d_row + H, d_row)
+    d_col = np.where(d_col >  W / 2, d_col - W, d_col)
+    d_col = np.where(d_col < -W / 2, d_col + W, d_col)
+
+    mask_f = mask.astype(np.float32)
+    d_row *= mask_f
+    d_col *= mask_f
+
+    # ── Reverse-slot table ────────────────────────────────────────────────────
+    # rev_slot[i, k] = kp  such that  neighbors[neighbors[i,k], kp] == i
+    rev_slot = np.full((N, K), -1, dtype=np.int32)
+    i_idx = np.arange(N, dtype=np.int32)
+    for kp in range(K):
+        for k in range(K):
+            j_vals = neighbors[:, k]
+            match = (neighbors[j_vals, kp] == i_idx) & mask[:, k]
+            rev_slot[:, k] = np.where(match & (rev_slot[:, k] < 0),
+                                      kp, rev_slot[:, k])
+
+    # ── Panel A: Heat flux ────────────────────────────────────────────────────
+    T = T_final.astype(np.float32)
+    W_abs  = np.abs(J_nk) * mask_f
+    W_norm = W_abs / (W_abs.sum(axis=1, keepdims=True) + 1e-8)
+    dT     = (T[neighbors] - T[:, None]) * mask_f
+    q_col  = (W_norm * dT * d_col).sum(axis=1).reshape(H, W)
+    q_row  = (W_norm * dT * d_row).sum(axis=1).reshape(H, W)
+
+    # ── Panel B: Conductance asymmetry ────────────────────────────────────────
+    J_abs = np.abs(J_nk)
+    J_rev = np.zeros_like(J_abs)
+    for k in range(K):
+        for kp in range(K):
+            sel = (rev_slot[:, k] == kp) & mask[:, k]
+            if sel.any():
+                J_rev[sel, k] = J_abs[neighbors[sel, k], kp]
+    Delta_W     = (J_abs - J_rev) * mask_f
+    asym_scalar = Delta_W.sum(axis=1).reshape(H, W)
+    asym_col    = (Delta_W * d_col).sum(axis=1).reshape(H, W)
+    asym_row    = (Delta_W * d_row).sum(axis=1).reshape(H, W)
+
+    # ── Panel C: Spin alignment current ───────────────────────────────────────
+    S        = S_final.astype(np.float32)
+    f_ik     = J_nk * S[:, None] * S[neighbors] * mask_f
+    spin_col = (f_ik * d_col).sum(axis=1).reshape(H, W)
+    spin_row = (f_ik * d_row).sum(axis=1).reshape(H, W)
+
+    # ── Quiver helper ─────────────────────────────────────────────────────────
+    stride = max(1, H // 16)
+    ys = np.arange(0, H, stride)
+    xs = np.arange(0, W, stride)
+    XX, YY = np.meshgrid(xs, ys)
+
+    def _panel(ax, bg, bg_cmap, bg_vmin, bg_vmax,
+               U_full, V_full, q_cmap, panel_title):
+        ax.imshow(bg, cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax, origin="upper")
+        U   = U_full[::stride, ::stride]
+        V   = V_full[::stride, ::stride]
+        mag = np.hypot(U, V)
+        peak = float(np.percentile(mag, 95)) if mag.max() > 0 else 1.0
+        if peak > 0:
+            U = U / (peak + 1e-8)
+            V = V / (peak + 1e-8)
+        ax.quiver(XX, YY, U, V, mag,
+                  cmap=q_cmap, alpha=0.85, clim=(0, peak),
+                  angles="xy", scale_units="xy",
+                  scale=1.0 / (stride * 0.45))
+        ax.set_title(panel_title, fontsize=10)
+        ax.axis("off")
+
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+    _panel(axs[0], T.reshape(H, W), "magma", cold_t, hot_t,
+           q_col, q_row, "cool", "Heat Flux")
+
+    abs_max = float(np.abs(asym_scalar).max()) or 1.0
+    _panel(axs[1], asym_scalar, "RdBu_r", -abs_max, abs_max,
+           asym_col, asym_row, "PuOr", "Conductance Asymmetry")
+
+    _panel(axs[2], S.reshape(H, W), "gray", -1, 1,
+           spin_col, spin_row, "plasma", "Spin Alignment Current")
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
 def plot_comparison(
     all_T_finals: Dict[str, np.ndarray],
     H: int,
@@ -482,6 +617,10 @@ def generate_report(
                                            f"{r.name}", hot_t, cold_t)
         fig_conn     = plot_connectivity(r.J_best, r.mask, r.neighbors, H, W,
                                          f"Connectivity — {r.name}")
+        fig_flows    = plot_directional_flows(r.J_best, r.mask, r.neighbors,
+                                              r.T_final, r.S_final, H, W,
+                                              hot_t, cold_t,
+                                              f"Directional Flows — {r.name}")
         all_T_finals[r.name] = r.T_final
 
         # Optional animation section
@@ -524,6 +663,9 @@ def generate_report(
             </div>
             <div class="wide-panel">
                 <img src="data:image/png;base64,{fig_conn}" alt="Connectivity">
+            </div>
+            <div class="wide-panel">
+                <img src="data:image/png;base64,{fig_flows}" alt="Directional Flows">
             </div>{anim_html}
         </div>""")
 

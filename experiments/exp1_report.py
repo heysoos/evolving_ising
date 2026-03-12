@@ -257,8 +257,10 @@ def fig_controller_strategy(params_flat, config):
         s_i_anti = np.ones(len(TT_flat),  dtype=np.float32)
         s_j_anti = np.full(len(TT_flat), -1.0, dtype=np.float32)
 
-        T_mean  = float(config.get('T_mean', 2.5))
-        delta_T = float(config.get('delta_T', 1.5))
+        # Doesn't get used?
+        # T_mean  = float(config.get('T_mean', 2.5))
+        # delta_T = float(config.get('delta_T', 1.5))
+
         # We pass T_norm per-bond via propose_updates; internally it scales
         # so we pass each unique T_norm as a scalar repeated over bonds.
         # Because propose_updates accepts a scalar T_norm, we loop row by row.
@@ -361,6 +363,9 @@ def fig_controller_budget_sensitivity(params_flat, config):
 def _simulate_final_J(run_dir, config, n_cycles=5):
     """Run a short simulation with the saved best controller and return J state.
 
+    Uses @jax.jit + lax.scan (same pattern as make_jax_eval_fn in optimiser.py).
+    No Python for loops in the hot path.
+
     Returns a dict with keys: J_final, J_bar_trace, T_trace
     or None on any failure.
     """
@@ -368,8 +373,7 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
         import jax
         import jax.numpy as jnp
         from evolving_ising.model import IsingModel
-        from work_extraction.budgets import BondBudget
-        from work_extraction.controller import LocalController, LocalMagnetisationTracker
+        from work_extraction.controller import _mlp_forward
     except ImportError:
         return None
 
@@ -380,21 +384,22 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
         ctrl_data = np.load(ctrl_path)
         params_flat = ctrl_data['params']
 
-        L             = int(config.get('L', 32))
-        T_mean        = float(config.get('T_mean', 2.5))
-        delta_T       = float(config.get('delta_T', 1.5))
-        tau           = float(config.get('tau', 200))
+        L               = int(config.get('L', 32))
+        T_mean          = float(config.get('T_mean', 2.5))
+        delta_T         = float(config.get('delta_T', 1.5))
+        tau             = float(config.get('tau', 200))
         steps_per_cycle = int(config.get('steps_per_cycle', 200))
-        J_init        = float(config.get('J_init', T_mean / 2.269))
-        J_min         = float(config.get('J_min', 0.01))
-        J_max         = float(config.get('J_max', 5.0))
+        num_sweeps      = int(config.get('num_sweeps', 1))
+        J_init_val      = float(config.get('J_init', T_mean / 2.269))
+        J_min           = float(config.get('J_min', 0.01))
+        J_max           = float(config.get('J_max', 5.0))
         bond_update_frac = float(config.get('bond_update_frac', 0.1))
-        delta_J_max   = float(config.get('delta_J_max', 0.1))
-        hidden_size   = int(config.get('hidden_size', 8))
-        mag_ema_alpha = float(config.get('mag_ema_alpha', 0.05))
-        B_scale       = float(config.get('B_scale', 2.0))
-        lam           = float(config.get('lambda', 0.05))
-        budget_alpha  = float(config.get('budget_alpha', 0.1))
+        delta_J_max     = float(config.get('delta_J_max', 0.1))
+        hidden_size     = int(config.get('hidden_size', 8))
+        mag_alpha       = float(config.get('mag_ema_alpha', 0.05))
+        B_scale         = float(config.get('B_scale', 2.0))
+        lam             = float(config.get('lambda', 0.05))
+        budget_alpha    = float(config.get('budget_alpha', 0.1))
 
         model = IsingModel(
             (L, L),
@@ -403,88 +408,121 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
         )
         N = model.n
         K = model.K
-        neighbors_np = np.asarray(model.neighbors)
-        mask_np      = np.asarray(model.mask, dtype=bool)
+        neighbors_np = np.asarray(model.neighbors)    # (N, K)
+        mask_np      = np.asarray(model.mask, dtype=bool)  # (N, K)
 
-        valid_i, valid_k = np.where(mask_np)
-        valid_j = neighbors_np[valid_i, valid_k]
-        n_bonds_total = len(valid_i)
-        n_updates = max(1, int(n_bonds_total * bond_update_frac))
+        neighbors_jax = jnp.asarray(neighbors_np)
+        mask_f        = jnp.asarray(mask_np, dtype=jnp.float32)
+        valid_count   = jnp.float32(mask_np.sum())
 
-        t_steps = np.arange(steps_per_cycle, dtype=np.float32)
-        T_schedule = T_mean + delta_T * np.sin(2.0 * np.pi * t_steps / tau)
+        valid_i_np, valid_k_np = np.where(mask_np)
+        valid_j_np  = neighbors_np[valid_i_np, valid_k_np]
+        n_bonds_total = len(valid_i_np)
+        n_updates     = max(1, int(n_bonds_total * bond_update_frac))
 
-        J_nk = np.full((N, K), J_init, dtype=np.float32) * mask_np
-        J_jax = jnp.array(J_nk)
+        valid_i_jax = jnp.asarray(valid_i_np, dtype=jnp.int32)
+        valid_k_jax = jnp.asarray(valid_k_np, dtype=jnp.int32)
+        valid_j_jax = jnp.asarray(valid_j_np, dtype=jnp.int32)
 
+        J_init_jax = jnp.full((N, K), J_init_val, dtype=jnp.float32) * mask_f
+        params_jax = jnp.asarray(params_flat)
+
+        layer_specs = (
+            ('W1', (5, hidden_size)),
+            ('b1', (hidden_size,)),
+            ('W2', (hidden_size, hidden_size)),
+            ('b2', (hidden_size,)),
+            ('W3', (hidden_size, 1)),
+            ('b3', (1,)),
+        )
+
+        # --- Pure JAX bond budget closures (mirrors make_jax_eval_fn) ---
+        def bud_init():
+            return jnp.zeros((N, K), dtype=jnp.float32)
+
+        def bud_update(bud, s_bef, s_aft):
+            nbr_bef = s_bef[neighbors_jax]
+            nbr_aft = s_aft[neighbors_jax]
+            ordering = jnp.maximum(0.0, s_aft[:, None] * nbr_aft
+                                   - s_bef[:, None] * nbr_bef) * mask_f
+            return bud + budget_alpha * ordering
+
+        def bud_get(bud, si, sk, sj):
+            return jnp.maximum(0.0, bud[si, sk])
+
+        def bud_spend(bud, si, sk, sj, costs, can_apply):
+            spend = jnp.where(can_apply, costs, 0.0)
+            return jnp.maximum(0.0, bud.at[si, sk].add(-spend))
+
+        # --- Warm up then run all cycles with lax.scan ---
         key = jax.random.PRNGKey(42)
         key, init_key, warmup_key = jax.random.split(key, 3)
         spins = model.init_spins(init_key, batch_size=1)
         spins, _ = model.metropolis_checkerboard_sweeps(
-            warmup_key, spins, J_jax, T_mean, 200
+            warmup_key, spins, J_init_jax, T_mean, 200
         )
 
-        budget = BondBudget(neighbors_np, mask_np, alpha=budget_alpha)
-        ctrl = LocalController(delta_J_max=delta_J_max, hidden_size=hidden_size)
-        ctrl.set_params(params_flat)
-        mag_tracker = LocalMagnetisationTracker(N, alpha=mag_ema_alpha)
-        rng = np.random.default_rng(0)
+        def _step_fn(carry, t):
+            spins_c, key_c, J_c, bud_c, mag_c = carry
+            T_t = T_mean + delta_T * jnp.sin(2.0 * jnp.pi * t / tau)
 
-        J_bar_trace = []
-        T_trace = []
+            s_bef_f = jnp.mean(spins_c.astype(jnp.float32), axis=0)
+            key_c, sub_m, sub_b = jax.random.split(key_c, 3)
+            spins_c, _ = model.metropolis_checkerboard_sweeps(
+                sub_m, spins_c, J_c, T_t, num_sweeps
+            )
+            s_aft_f = jnp.mean(spins_c.astype(jnp.float32), axis=0)
 
-        for cycle in range(n_cycles):
-            is_last = (cycle == n_cycles - 1)
-            for t in range(steps_per_cycle):
-                T_t = float(T_schedule[t])
-                spins_before = spins
-                key, subkey = jax.random.split(key)
-                spins, energies = model.metropolis_checkerboard_sweeps(
-                    subkey, spins, J_jax, T_t, 1
-                )
-                budget.update(spins_before, spins, J_jax, T_t)
+            bud_c = bud_update(bud_c, s_bef_f, s_aft_f)
+            mag_c = mag_alpha * s_aft_f + (1.0 - mag_alpha) * mag_c
 
-                spins_np = np.asarray(spins[0])
-                mag_tracker.update(spins_np)
+            perm = jax.random.permutation(sub_b, n_bonds_total)[:n_updates]
+            si = valid_i_jax[perm]
+            sk = valid_k_jax[perm]
+            sj = valid_j_jax[perm]
 
-                bond_idx = rng.choice(n_bonds_total, size=n_updates, replace=False)
-                sel_i = valid_i[bond_idx]
-                sel_k = valid_k[bond_idx]
-                sel_j = valid_j[bond_idx]
+            T_norm   = (T_t - T_mean) / delta_T
+            bud_vals = bud_get(bud_c, si, sk, sj)
+            bud_norm = jnp.tanh(bud_vals / B_scale)
+            x = jnp.stack([s_aft_f[si], s_aft_f[sj], mag_c[si],
+                           jnp.full(n_updates, T_norm, dtype=jnp.float32),
+                           bud_norm], axis=-1)
 
-                s_i_vals = spins_np[sel_i]
-                s_j_vals = spins_np[sel_j]
-                m_bar = mag_tracker.get()[sel_i]
-                T_norm = (T_t - T_mean) / delta_T
+            dJ   = _mlp_forward(params_jax, x, layer_specs, delta_J_max).ravel()
+            costs = jnp.abs(s_aft_f[si] * s_aft_f[sj] * dJ) + lam * jnp.abs(dJ)
+            can_apply = bud_vals >= costs
 
-                budgets_arr = budget.get_all_budgets_for_bonds_nk(sel_i, sel_k, sel_j)
-                budgets_np_local = np.asarray(budgets_arr)
-                budget_norm = np.tanh(budgets_np_local / B_scale).astype(np.float32)
+            J_c = jnp.clip(
+                J_c.at[si, sk].add(jnp.where(can_apply, dJ, 0.0)),
+                J_min, J_max
+            ) * mask_f
+            bud_c = bud_spend(bud_c, si, sk, sj, costs, can_apply)
 
-                delta_J = np.asarray(ctrl.propose_updates(
-                    s_i_vals, s_j_vals, m_bar, T_norm, budget_norm
-                ))
-                costs = np.abs(s_i_vals * s_j_vals * delta_J) + lam * np.abs(delta_J)
-                can_apply = budgets_np_local >= costs
+            J_bar = jnp.sum(J_c * mask_f) / jnp.maximum(valid_count, 1.0)
+            return (spins_c, key_c, J_c, bud_c, mag_c), (J_bar, T_t)
 
-                if can_apply.any():
-                    J_updated = np.array(J_jax)
-                    J_updated[sel_i[can_apply], sel_k[can_apply]] = np.clip(
-                        J_updated[sel_i[can_apply], sel_k[can_apply]]
-                        + delta_J[can_apply],
-                        J_min, J_max
-                    )
-                    budget.spend_all_nk(sel_i, sel_k, sel_j, costs, can_apply)
-                    J_jax = jnp.array(J_updated)
+        def _cycle_fn(carry, _):
+            t_arr = jnp.arange(steps_per_cycle, dtype=jnp.int32)
+            carry, (J_bars, T_ts) = jax.lax.scan(_step_fn, carry, t_arr)
+            return carry, (J_bars, T_ts)
 
-                if is_last:
-                    J_bar_trace.append(float(np.mean(np.array(J_jax)[mask_np])))
-                    T_trace.append(T_t)
+        @jax.jit
+        def _run_sim(spins, key):
+            init_carry = (spins, key, J_init_jax, bud_init(),
+                          jnp.zeros(N, dtype=jnp.float32))
+            final_carry, (J_bars_all, T_ts_all) = jax.lax.scan(
+                _cycle_fn, init_carry, None, length=n_cycles
+            )
+            spins_f, key_f, J_final, bud_f, mag_f = final_carry
+            return J_final, J_bars_all, T_ts_all
 
+        J_final_jax, J_bars_all, T_ts_all = _run_sim(spins, key)
+
+        # J_bars_all, T_ts_all: (n_cycles, steps_per_cycle) → flatten
         return {
-            'J_final':    np.array(J_jax),
-            'J_bar_trace': np.array(J_bar_trace),
-            'T_trace':     np.array(T_trace),
+            'J_final':     np.asarray(J_final_jax),
+            'J_bar_trace': np.asarray(J_bars_all).ravel(),
+            'T_trace':     np.asarray(T_ts_all).ravel(),
         }
 
     except Exception:
@@ -560,7 +598,7 @@ def fig_J_histogram(J_final, J_init, T_mean):
 
 
 def fig_J_phase_portrait(J_bar_trace, T_trace):
-    """J̄–T phase portrait of last cycle."""
+    """J̄–T phase portrait of all simulated cycles."""
     try:
         fig, ax = plt.subplots(figsize=(6, 5))
         # Draw the loop with a gradient of colors to show direction
@@ -571,7 +609,7 @@ def fig_J_phase_portrait(J_bar_trace, T_trace):
         lc = LineCollection(segs, cmap='viridis', linewidth=1.8)
         lc.set_array(np.linspace(0, 1, len(segs)))
         ax.add_collection(lc)
-        fig.colorbar(lc, ax=ax, label='Cycle progress (0=start → 1=end)')
+        fig.colorbar(lc, ax=ax, label='Simulation progress (start → end)')
 
         ax.plot(T_trace[0],  J_bar_trace[0],  'go', markersize=8, label='start')
         ax.plot(T_trace[-1], J_bar_trace[-1], 'rs', markersize=8, label='end')
@@ -579,7 +617,7 @@ def fig_J_phase_portrait(J_bar_trace, T_trace):
         ax.set_ylim(J_bar_trace.min() * 0.99, J_bar_trace.max() * 1.01)
         ax.set_xlabel('Bath temperature T')
         ax.set_ylabel('Mean coupling J̄')
-        ax.set_title('J̄–T Phase Portrait (last cycle)')
+        ax.set_title('J̄–T Phase Portrait (all cycles)')
         ax.legend(fontsize=9)
         fig.tight_layout()
         return fig
@@ -976,17 +1014,19 @@ def generate_report(results_dir, baseline_path=None, animate=True):
             if model_shared is not None and animate:
                 try:
                     print(f'  [info] animating {label}...', file=sys.stderr)
-                    sf, jf, _, wt = run_anim_frames(
+                    sf, jf, _, wt, tt, bf = run_anim_frames(
                         model_shared, run_config, 'bond',
                         params_flat=ctrl_data['params'],
                         n_cycles=10, steps_per_cycle=80, frame_skip=4,
                     )
                     gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
-                                                wnet_trace=wt)
+                                                wnet_trace=wt, T_trace=tt,
+                                                bud_frames=bf)
                     if gif_b64:
                         panel += _gif_tag(gif_b64, 'Simulation animation',
-                                          caption='Spin state (left), mean J per site (right), '
-                                                  'and cumulative W_net trace (bottom) over 10 cycles. '
+                                          caption='Spin state (left), mean J (centre), per-site budget (right), '
+                                                  'cumulative W_net and bath temperature T(t) below, '
+                                                  'over 10 cycles. '
                                                   'J structure emerges as the controller adapts bonds to the oscillating bath.')
                 except Exception as _e:
                     print(f'  [warn] animation {label}: {_e}', file=sys.stderr)

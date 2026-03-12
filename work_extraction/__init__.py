@@ -16,7 +16,7 @@ from .budgets import (
     NeighbourhoodBudget,
     DiffusingBudget,
 )
-from .optimiser import WorkExtractionES, evaluate_fitness
+from .optimiser import WorkExtractionES, make_jax_eval_fn
 from .train import DEFAULT_CONFIG, ExperimentResult, make_budget, run_experiment
 
 __all__ = [
@@ -34,7 +34,7 @@ __all__ = [
     'NeighbourhoodBudget',
     'DiffusingBudget',
     'WorkExtractionES',
-    'evaluate_fitness',
+    'make_jax_eval_fn',
     'DEFAULT_CONFIG',
     'ExperimentResult',
     'make_budget',

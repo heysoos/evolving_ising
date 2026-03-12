@@ -186,6 +186,15 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
                     warmup_sweeps=200):
     """Run simulation and capture spin + J frames for animation.
 
+    Mirrors make_jax_eval_fn in optimiser.py: the ENTIRE simulation — including
+    controller MLP, budget updates, and J remodelling — runs inside a single
+    jax.jit with nested lax.scan calls.  No Python loops in the hot path.
+
+    Outer scan: over n_frames = (n_cycles * spc) // frame_skip frames.
+    Inner scan: over frame_skip physics steps per frame.
+    Per-frame outputs (spins, J_mean, cumulative W_net, T) are returned by the
+    outer scan and converted to NumPy lists.
+
     Parameters
     ----------
     model : IsingModel
@@ -195,25 +204,27 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
         If provided, the controller MLP weights to use.
     n_cycles : int
     steps_per_cycle : int or None  (defaults to config['steps_per_cycle'])
-    frame_skip : int  — save a frame every this many steps
+    frame_skip : int  — physics steps per frame
     warmup_sweeps : int
 
     Returns
     -------
     spin_frames : list of (L, L) int8 arrays
     J_mean_frames : list of (L, L) float32 arrays  (mean J strength per site)
-    W_net_cycles : list of floats
+    W_net_cycles : list  (empty — callers discard with _)
     wnet_trace : list of floats  (cumulative W_net at each captured frame)
+    T_frames : list of floats  (bath temperature at each captured frame)
     """
     import jax
     import jax.numpy as jnp
-    from work_extraction.controller import LocalController
+    from work_extraction.controller import _mlp_forward
 
+    # ------------------------------------------------------------------ config
     L = config.get('L', 32)
     T_mean = float(config['T_mean'])
     delta_T = float(config['delta_T'])
     tau = float(config['tau'])
-    J_init = float(config['J_init'])
+    J_init_val = float(config['J_init'])
     J_min = float(config.get('J_min', 0.01))
     J_max = float(config.get('J_max', 5.0))
     lam = float(config.get('lambda', 0.05))
@@ -223,105 +234,207 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     bond_update_frac = float(config.get('bond_update_frac', 0.1))
     B_scale = float(config.get('B_scale', 2.0))
     num_sweeps = int(config.get('num_sweeps', 1))
+    budget_alpha = float(config.get('budget_alpha', config.get('mag_ema_alpha', 0.05)))
+    gamma = float(config.get('gamma', 0.25))
+    D_diff = float(config.get('D', 0.1))
+    tau_mu = float(config.get('tau_mu', 20.0))
     spc = int(config.get('steps_per_cycle', 100)) if steps_per_cycle is None else steps_per_cycle
+    T_norm_denom = delta_T if delta_T > 0 else 1.0
 
+    # ---------------------------------------------------- precomputed JAX arrays
+    N = model.n
+    K = model.K
     neighbors_np = np.asarray(model.neighbors)
     mask_np = np.asarray(model.mask, dtype=bool)
-    N, K = neighbors_np.shape
-    valid_count_per_site = mask_np.sum(axis=1)
+    mask_f = jnp.asarray(mask_np, dtype=jnp.float32)
+    neighbors_jax = jnp.asarray(neighbors_np, dtype=jnp.int32)
+    K_eff_jax = jnp.sum(mask_f, axis=1)
 
-    valid_i, valid_k = np.where(mask_np)
-    valid_j = neighbors_np[valid_i, valid_k]
-    n_bonds = len(valid_i)
-    n_updates = max(1, int(n_bonds * bond_update_frac))
+    valid_i_np, valid_k_np = np.where(mask_np)
+    valid_j_np = neighbors_np[valid_i_np, valid_k_np]
+    n_bonds_total = len(valid_i_np)
+    n_updates = max(1, int(n_bonds_total * bond_update_frac))
+    valid_i_jax = jnp.asarray(valid_i_np, dtype=jnp.int32)
+    valid_k_jax = jnp.asarray(valid_k_np, dtype=jnp.int32)
+    valid_j_jax = jnp.asarray(valid_j_np, dtype=jnp.int32)
 
-    budget = _make_budget(budget_type, neighbors_np, mask_np, config)
+    valid_count_jax = jnp.asarray(mask_np.sum(axis=1), dtype=jnp.float32)
+    J_init_jax = jnp.full((N, K), J_init_val, dtype=jnp.float32) * mask_f
 
-    controller = None
-    if params_flat is not None:
-        controller = LocalController(delta_J_max=delta_J_max, hidden_size=hidden_size)
-        controller.set_params(params_flat)
+    # Temperature schedule reshaped to (n_frames, frame_skip) for outer scan
+    total_steps = n_cycles * spc
+    n_frames = total_steps // frame_skip
+    t_all = np.arange(total_steps, dtype=np.float32)
+    T_sched = (T_mean + delta_T * np.sin(2.0 * np.pi * t_all / tau)).astype(np.float32)
+    T_chunks_jax = jnp.array(T_sched[:n_frames * frame_skip].reshape(n_frames, frame_skip))
 
+    # Controller params as a JAX constant (None → controller code excluded at trace time)
+    params_jax = jnp.asarray(params_flat, dtype=jnp.float32) if params_flat is not None else None
+    layer_specs = (
+        ('W1', (5, hidden_size)),
+        ('b1', (hidden_size,)),
+        ('W2', (hidden_size, hidden_size)),
+        ('b2', (hidden_size,)),
+        ('W3', (hidden_size, 1)),
+        ('b3', (1,)),
+    )
+
+    # ----------------------------------------- pure-JAX budget functions
+    # Mirrors make_jax_eval_fn exactly so the budget dynamics are identical.
+    if budget_type == 'none':
+        def bud_init(): return jnp.zeros(1, dtype=jnp.float32)
+        def bud_update(bud, s_bef, s_aft): return bud
+        def bud_get(bud, si, sk, sj): return jnp.full(n_updates, jnp.inf, dtype=jnp.float32)
+        def bud_spend(bud, si, sk, sj, costs, mask): return bud
+
+    elif budget_type == 'bond':
+        def bud_init(): return jnp.zeros((N, K), dtype=jnp.float32)
+        def bud_update(bud, s_bef, s_aft):
+            ordering = jnp.maximum(
+                0.0, s_aft[:, None] * s_aft[neighbors_jax]
+                   - s_bef[:, None] * s_bef[neighbors_jax]
+            ) * mask_f
+            return bud + budget_alpha * ordering
+        def bud_get(bud, si, sk, sj): return jnp.maximum(0.0, bud[si, sk])
+        def bud_spend(bud, si, sk, sj, costs, mask):
+            return jnp.maximum(0.0, bud.at[si, sk].add(-jnp.where(mask, costs, 0.0)))
+
+    elif budget_type == 'neighbourhood':
+        def bud_init(): return jnp.zeros(N, dtype=jnp.float32)
+        def bud_update(bud, s_bef, s_aft):
+            ordering = jnp.maximum(
+                0.0, s_aft[:, None] * s_aft[neighbors_jax]
+                   - s_bef[:, None] * s_bef[neighbors_jax]
+            ) * mask_f
+            return bud + budget_alpha * ordering.sum(axis=1)
+        def bud_get(bud, si, sk, sj):
+            nbhd = bud + gamma * (bud[neighbors_jax] * mask_f).sum(axis=1)
+            return jnp.minimum(nbhd[si], nbhd[sj])
+        def bud_spend(bud, si, sk, sj, costs, mask):
+            half = jnp.where(mask, costs / 2.0, 0.0)
+            return jnp.maximum(0.0, bud.at[si].add(-half).at[sj].add(-half))
+
+    elif budget_type == 'diffusing':
+        def bud_init(): return jnp.zeros(N, dtype=jnp.float32)
+        def bud_update(bud, s_bef, s_aft):
+            ordering = jnp.maximum(
+                0.0, s_aft[:, None] * s_aft[neighbors_jax]
+                   - s_bef[:, None] * s_bef[neighbors_jax]
+            ) * mask_f
+            eta = budget_alpha * ordering.sum(axis=1)
+            laplacian = (bud[neighbors_jax] * mask_f).sum(axis=1) - K_eff_jax * bud
+            return jnp.maximum(0.0, bud + D_diff * laplacian + eta - bud / tau_mu)
+        def bud_get(bud, si, sk, sj):
+            return jnp.minimum(jnp.maximum(0.0, bud[si]), jnp.maximum(0.0, bud[sj]))
+        def bud_spend(bud, si, sk, sj, costs, mask):
+            half = jnp.where(mask, costs / 2.0, 0.0)
+            return jnp.maximum(0.0, bud.at[si].add(-half).at[sj].add(-half))
+
+    else:
+        raise ValueError(f'Unknown budget_type: {budget_type!r}')
+
+    # ----------------------------------------- inner step function (lax.scan body)
+    # Python `if params_jax is not None` is evaluated at trace time, so the
+    # controller block is compiled in only when a controller is active.
+    def _step_fn(carry, T_t):
+        spins, key, J, bud, mag_ema, running_wnet, E_prev = carry
+        s_bef_f = spins[0].astype(jnp.float32)
+        key, sub_m, sub_b = jax.random.split(key, 3)
+        spins, _ = model.metropolis_checkerboard_sweeps(sub_m, spins, J, T_t, num_sweeps)
+        s_aft_f = spins[0].astype(jnp.float32)
+        E_after = jnp.mean(model.energy(J, spins))
+        dE = E_after - E_prev
+        running_wnet = running_wnet + jnp.maximum(-dE, 0.0) - jnp.maximum(dE, 0.0)
+        bud = bud_update(bud, s_bef_f, s_aft_f)
+        mag_ema = mag_alpha * s_aft_f + (1.0 - mag_alpha) * mag_ema
+
+        if params_jax is not None:
+            perm = jax.random.permutation(sub_b, n_bonds_total)[:n_updates]
+            si = valid_i_jax[perm]
+            sk = valid_k_jax[perm]
+            sj = valid_j_jax[perm]
+            T_norm = (T_t - T_mean) / T_norm_denom
+            bud_vals = bud_get(bud, si, sk, sj)
+            bud_norm = jnp.tanh(bud_vals / B_scale)
+            x = jnp.stack([
+                s_aft_f[si], s_aft_f[sj], mag_ema[si],
+                jnp.full(n_updates, T_norm, dtype=jnp.float32), bud_norm,
+            ], axis=-1)
+            dJ = _mlp_forward(params_jax, x, layer_specs, delta_J_max).ravel()
+            costs = jnp.abs(s_aft_f[si] * s_aft_f[sj] * dJ) + lam * jnp.abs(dJ)
+            can_apply = bud_vals >= costs
+            J = jnp.clip(J.at[si, sk].add(jnp.where(can_apply, dJ, 0.0)), J_min, J_max) * mask_f
+            bud = bud_spend(bud, si, sk, sj, costs, can_apply)
+            E_after = jnp.mean(model.energy(J, spins))  # re-evaluate after J update
+
+        return (spins, key, J, bud, mag_ema, running_wnet, E_after), None
+
+    # ----------------------------------------- outer frame function (lax.scan body)
+    def _frame_fn(carry, T_chunk):
+        spins, key, J, bud, mag_ema, running_wnet = carry
+        E_init = jnp.mean(model.energy(J, spins))
+        step_carry = (spins, key, J, bud, mag_ema, running_wnet, E_init)
+        (spins, key, J, bud, mag_ema, running_wnet, _), _ = jax.lax.scan(
+            _step_fn, step_carry, T_chunk
+        )
+        J_mean = jnp.where(
+            valid_count_jax > 0,
+            (J * mask_f).sum(axis=1) / jnp.maximum(valid_count_jax, 1),
+            J_init_val,
+        )
+        # Per-site budget mean (for visualisation)
+        if budget_type == 'bond':
+            bud_mean = (bud * mask_f).sum(axis=1) / jnp.maximum(valid_count_jax, 1)
+        elif budget_type == 'none':
+            bud_mean = jnp.zeros(N, dtype=jnp.float32)
+        else:  # neighbourhood, diffusing — bud is already (N,)
+            bud_mean = bud
+        return (spins, key, J, bud, mag_ema, running_wnet), (
+            spins[0],       # (N,) int8  — spin state at end of frame
+            J_mean,         # (N,) float32
+            running_wnet,   # scalar — cumulative W_net through this frame
+            T_chunk[0],     # scalar — T at start of frame
+            bud_mean,       # (N,) float32 — per-site budget mean
+        )
+
+    # ----------------------------------------- single JIT call for all frames
+    @jax.jit
+    def _run_all(spins, key):
+        init = (
+            spins, key, J_init_jax, bud_init(),
+            jnp.zeros(N, dtype=jnp.float32),  # mag_ema
+            jnp.float32(0.0),                  # running_wnet
+        )
+        _, (spins_all, J_mean_all, wnet_all, T_all, bud_all) = jax.lax.scan(
+            _frame_fn, init, T_chunks_jax
+        )
+        return spins_all, J_mean_all, wnet_all, T_all, bud_all
+
+    # Initialise and warmup (outside the main scan — one-time cost)
     key = jax.random.PRNGKey(42)
     key, ik, wk = jax.random.split(key, 3)
     spins = model.init_spins(ik, 1)
-    J_nk = np.full((N, K), J_init, dtype=np.float32) * mask_np
-    J_jax = jnp.asarray(J_nk)
+    spins, _ = model.metropolis_checkerboard_sweeps(wk, spins, J_init_jax, T_mean, warmup_sweeps)
 
-    spins, _ = model.metropolis_checkerboard_sweeps(wk, spins, J_jax, T_mean, warmup_sweeps)
+    # Run — single compiled call
+    spins_all, J_mean_all, wnet_all, T_all, bud_all = _run_all(spins, key)
 
-    mag_ema = np.zeros(N, dtype=np.float32)
-    spin_frames = []
-    J_mean_frames = []
-    W_net_cycles = []
-    wnet_trace = []
-    running_wnet = 0.0
-    rng = np.random.RandomState(0)
+    # Convert stacked JAX outputs → Python lists expected by callers
+    spins_np  = np.asarray(spins_all)   # (n_frames, N) int8
+    J_mean_np = np.asarray(J_mean_all)  # (n_frames, N) float32
+    wnet_np   = np.asarray(wnet_all)    # (n_frames,)
+    T_np      = np.asarray(T_all)       # (n_frames,)
 
-    t_global = 0
-    for _cycle in range(n_cycles):
-        Q_in = Q_out = 0.0
-        E_prev = float(jnp.mean(model.energy(J_jax, spins)))
+    spin_frames   = [spins_np[fi].reshape(L, L) for fi in range(n_frames)]
+    J_mean_frames = [J_mean_np[fi].reshape(L, L) for fi in range(n_frames)]
 
-        for t in range(spc):
-            T_t = T_mean + delta_T * np.sin(2.0 * np.pi * t_global / tau)
+    if budget_type == 'none':
+        bud_frames = None
+    else:
+        bud_np = np.asarray(bud_all)    # (n_frames, N) float32
+        bud_frames = [bud_np[fi].reshape(L, L) for fi in range(n_frames)]
 
-            spins_bef_f = np.asarray(spins[0], dtype=np.float32)
-            key, sk = jax.random.split(key)
-            spins, _ = model.metropolis_checkerboard_sweeps(sk, spins, J_jax, float(T_t), num_sweeps)
-            spins_aft_f = np.asarray(spins[0], dtype=np.float32)
-
-            E_now = float(jnp.mean(model.energy(J_jax, spins)))
-            dE = E_now - E_prev
-            Q_in += max(0.0, dE)
-            Q_out += max(0.0, -dE)
-            running_wnet += max(0.0, -dE) - max(0.0, dE)
-            E_prev = E_now
-
-            budget.update(spins_bef_f, spins_aft_f, J_nk, T_t)
-            mag_ema = mag_alpha * spins_aft_f + (1.0 - mag_alpha) * mag_ema
-
-            if controller is not None:
-                perm = rng.permutation(n_bonds)[:n_updates]
-                si = valid_i[perm]
-                sk_arr = valid_k[perm]
-                sj = valid_j[perm]
-
-                T_norm = (T_t - T_mean) / (delta_T if delta_T > 0 else 1.0)
-                bud_vals = np.asarray(budget.get_all_budgets_for_bonds_nk(si, sk_arr, sj),
-                                      dtype=np.float32)
-                bud_norm = np.tanh(bud_vals / B_scale)
-
-                x = np.stack([
-                    spins_aft_f[si], spins_aft_f[sj], mag_ema[si],
-                    np.full(n_updates, T_norm, dtype=np.float32), bud_norm,
-                ], axis=-1)
-
-                dJ = np.asarray(controller.forward(x)).ravel()
-                costs = np.abs(spins_aft_f[si] * spins_aft_f[sj] * dJ) + lam * np.abs(dJ)
-                can_apply = bud_vals >= costs
-
-                dJ_gated = np.where(can_apply, dJ, 0.0)
-                J_nk[si, sk_arr] = np.clip(J_nk[si, sk_arr] + dJ_gated, J_min, J_max)
-                J_nk *= mask_np
-                J_jax = jnp.asarray(J_nk)
-                budget.spend_all_nk(si, sk_arr, sj, costs, can_apply)
-
-            if t % frame_skip == 0:
-                spin_frames.append(np.asarray(spins[0]).reshape(L, L).copy())
-                J_mean = np.where(
-                    valid_count_per_site > 0,
-                    (J_nk * mask_np).sum(axis=1) / np.maximum(valid_count_per_site, 1),
-                    J_init,
-                )
-                J_mean_frames.append(J_mean.reshape(L, L).astype(np.float32).copy())
-                wnet_trace.append(running_wnet)
-
-            t_global += 1
-
-        W_net_cycles.append(Q_out - Q_in)
-
-    return spin_frames, J_mean_frames, W_net_cycles, wnet_trace
+    return spin_frames, J_mean_frames, [], list(wnet_np), list(T_np), bud_frames
 
 
 # ---------------------------------------------------------------------------
@@ -329,17 +442,23 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
 # ---------------------------------------------------------------------------
 
 def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5,
-                      wnet_trace=None):
-    """Render spin + J frames to an animated GIF using PIL; return base64 string or None.
+                      wnet_trace=None, T_trace=None, bud_frames=None):
+    """Render spin + J [+ budget] frames to an animated GIF; return base64 string or None.
 
-    Each GIF frame has two rows:
-      Top: spin state (left) | mean J per site (right)
-      Bottom (optional): cumulative W_net trace with a moving cursor
+    Layout (top to bottom):
+      Title bar : "Spins" | "Mean J" [| "Budget"]
+      Main row  : spin state | mean J [| per-site budget]   (2 or 3 panels wide)
+      W_net strip (optional): spans full width
+      T strip (optional)    : spans full width
+      X-label bar           : "time →"
 
     Parameters
     ----------
     wnet_trace : list of floats or None
-        Cumulative W_net at each frame. If provided, a trace strip is added.
+    T_trace    : list of floats or None
+    bud_frames : list of (L, L) float32 arrays or None
+        Per-site budget mean at each frame.  When provided a third panel is
+        added and all strips below extend to the wider canvas.
     """
     if not HAS_PIL:
         print('  Pillow not installed; skipping GIF (pip install pillow)')
@@ -348,72 +467,155 @@ def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5
         return None
 
     from PIL import Image as _PILImage
+    from PIL import ImageDraw as _ImageDraw
+
+    has_budget = bud_frames is not None and len(bud_frames) > 0
 
     step = max(1, len(spin_frames) // max_frames)
-    sf = spin_frames[::step]
-    jf = J_mean_frames[::step]
-    wt = wnet_trace[::step] if wnet_trace is not None else None
+    sf  = spin_frames[::step]
+    jf  = J_mean_frames[::step]
+    bf  = bud_frames[::step] if has_budget else None
+    wt_sub = wnet_trace[::step] if wnet_trace is not None else None
+    tt_sub = T_trace[::step]   if T_trace   is not None else None
 
+    L = sf[0].shape[0]
+    n_panels = 3 if has_budget else 2
+    strip_h = L // 2  # strip height in pre-scale pixels
+
+    # J colourscale
     J_arr = np.stack(jf)
     j_vmin, j_vmax = float(J_arr.min()), float(J_arr.max())
     if j_vmax <= j_vmin:
         j_vmax = j_vmin + 0.01
 
-    cmap = matplotlib.colormaps['viridis']
-    L = sf[0].shape[0]
-    strip_h = L // 2  # height of W_net strip (pre-scale)
+    # Budget colourscale
+    if has_budget:
+        b_arr = np.stack(bf)
+        b_vmin, b_vmax = float(b_arr.min()), float(b_arr.max())
+        if b_vmax <= b_vmin:
+            b_vmax = b_vmin + 0.01
 
-    # Pre-compute W_net trace bounds for consistent scaling across all frames
-    if wt is not None and len(wt) > 1:
-        wt_arr = np.array(wt, dtype=np.float64)
+    cmap_j = matplotlib.colormaps['viridis']
+    cmap_b = matplotlib.colormaps['plasma']
+
+    # W_net trace bounds
+    wt_arr = None
+    if wt_sub is not None and len(wt_sub) > 1:
+        wt_arr = np.array(wt_sub, dtype=np.float64)
         w_vmin = float(min(wt_arr.min(), 0.0))
         w_vmax = float(max(wt_arr.max(), w_vmin + 1.0))
-    else:
-        wt = None  # disable trace panel if too short
 
-    def _render_wnet_strip(frame_idx, n_total, strip_width):
-        """Render cumulative W_net trace as an RGB numpy strip."""
-        strip = np.full((strip_h, strip_width, 3), 28, dtype=np.uint8)  # dark bg
-        if wt is None:
-            return strip
-        # Draw zero line
-        y_zero = int((1.0 - (0.0 - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
-        y_zero = max(0, min(y_zero, strip_h - 1))
-        strip[y_zero, :] = [80, 80, 80]
-        # Draw trace up to current frame
+    # T trace bounds
+    tt_arr = None
+    if tt_sub is not None and len(tt_sub) > 1:
+        tt_arr = np.array(tt_sub, dtype=np.float64)
+        t_vmin = float(tt_arr.min())
+        t_vmax = float(tt_arr.max())
+        if t_vmax <= t_vmin:
+            t_vmax = t_vmin + 0.1
+
+    def _render_trace_strip(values, vmin, vmax, colour, frame_idx, n_total, strip_width):
+        """Generic growing-trace strip with a red cursor."""
+        strip = np.full((strip_h, strip_width, 3), 28, dtype=np.uint8)
+        # Reference line at midpoint
+        y_mid = int((1.0 - (0.5 * (vmin + vmax) - vmin) / (vmax - vmin)) * (strip_h - 1))
+        strip[max(0, min(y_mid, strip_h - 1)), :] = [80, 80, 80]
         for i in range(frame_idx + 1):
-            x = int(i / n_total * strip_width)
-            x = min(x, strip_width - 1)
-            y = int((1.0 - (wt_arr[i] - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
-            y = max(0, min(y, strip_h - 1))
-            strip[y, x] = [80, 200, 120]  # green trace
-        # Draw vertical cursor at current frame
-        x_cur = int(frame_idx / n_total * strip_width)
-        x_cur = min(x_cur, strip_width - 1)
-        strip[:, x_cur] = [200, 80, 80]  # red cursor
+            x = min(int(i / n_total * strip_width), strip_width - 1)
+            y = int((1.0 - (values[i] - vmin) / (vmax - vmin)) * (strip_h - 1))
+            strip[max(0, min(y, strip_h - 1)), x] = colour
+        x_cur = min(int(frame_idx / n_total * strip_width), strip_width - 1)
+        strip[:, x_cur] = [200, 80, 80]
         return strip
+
+    def _render_wnet_strip(fi, n_total, w):
+        # Zero-reference line instead of midpoint
+        strip = _render_trace_strip(wt_arr, w_vmin, w_vmax, [80, 200, 120], fi, n_total, w)
+        y_zero = int((1.0 - (0.0 - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
+        strip[max(0, min(y_zero, strip_h - 1)), :] = [80, 80, 80]
+        # Re-draw trace on top of zero line
+        for i in range(fi + 1):
+            x = min(int(i / n_total * w), w - 1)
+            y = int((1.0 - (wt_arr[i] - w_vmin) / (w_vmax - w_vmin)) * (strip_h - 1))
+            strip[max(0, min(y, strip_h - 1)), x] = [80, 200, 120]
+        x_cur = min(int(fi / n_total * w), w - 1)
+        strip[:, x_cur] = [200, 80, 80]
+        return strip
+
+    def _render_T_strip(fi, n_total, w):
+        return _render_trace_strip(tt_arr, t_vmin, t_vmax, [255, 140, 0], fi, n_total, w)
+
+    # Layout constants (pre-scale pixels)
+    TITLE_H = 6
+    BOT_H   = 5
 
     n_frames = len(sf)
     pil_frames = []
-    for frame_idx, (s, j) in enumerate(zip(sf, jf)):
-        # Top row: spin (left) | J map (right)
+    frame_iter = zip(sf, jf, bf) if has_budget else ((s, j, None) for s, j in zip(sf, jf))
+
+    for frame_idx, (s, j, b) in enumerate(frame_iter):
         spin_rgb = np.where(s[:, :, np.newaxis] > 0, 220, 30).astype(np.uint8)
         spin_rgb = np.broadcast_to(spin_rgb, (*s.shape, 3)).copy()
-
         j_norm = np.clip((j - j_vmin) / (j_vmax - j_vmin), 0.0, 1.0)
-        j_rgb = (cmap(j_norm)[:, :, :3] * 255).astype(np.uint8)
+        j_rgb  = (cmap_j(j_norm)[:, :, :3] * 255).astype(np.uint8)
 
-        top = np.concatenate([spin_rgb, j_rgb], axis=1)  # (L, 2L, 3)
+        W_px = n_panels * L
+        title_bar = np.full((TITLE_H, W_px, 3), 18, dtype=np.uint8)
+        main_panels = [spin_rgb, j_rgb]
+        if has_budget:
+            b_norm = np.clip((b - b_vmin) / (b_vmax - b_vmin), 0.0, 1.0)
+            b_rgb  = (cmap_b(b_norm)[:, :, :3] * 255).astype(np.uint8)
+            main_panels.append(b_rgb)
+        main = np.concatenate(main_panels, axis=1)  # (L, n_panels*L, 3)
 
-        if wt is not None:
-            bottom = _render_wnet_strip(frame_idx, n_frames, top.shape[1])
-            combined = np.concatenate([top, bottom], axis=0)  # (L + strip_h, 2L, 3)
-        else:
-            combined = top
+        bands = [title_bar, main]
+        if wt_arr is not None:
+            bands.append(_render_wnet_strip(frame_idx, n_frames, W_px))
+        if tt_arr is not None:
+            bands.append(_render_T_strip(frame_idx, n_frames, W_px))
+            bands.append(np.full((BOT_H, W_px, 3), 18, dtype=np.uint8))
 
+        combined = np.concatenate(bands, axis=0)
         img = _PILImage.fromarray(combined, mode='RGB')
-        H, W = combined.shape[:2]
-        img = img.resize((W * scale, H * scale), _PILImage.NEAREST)
+        H_raw, W_raw = combined.shape[:2]
+        img = img.resize((W_raw * scale, H_raw * scale), _PILImage.NEAREST)
+
+        # ---- text labels on scaled image ----
+        draw = _ImageDraw.Draw(img)
+        W_s  = W_raw * scale
+        L_s  = L * scale
+        th_s = TITLE_H * scale
+        sh_s = strip_h * scale
+
+        def _txt(xy, text, fill, stroke=(12, 12, 12)):
+            x, y = xy
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                draw.text((x + dx, y + dy), text, fill=stroke)
+            draw.text(xy, text, fill=fill)
+
+        # Panel titles (dark title bar — no outline needed)
+        draw.text((4,           2), "Spins",  fill=(255, 255, 180))
+        draw.text((L_s + 4,     2), "Mean J", fill=(255, 255, 180))
+        if has_budget:
+            draw.text((2 * L_s + 4, 2), "Budget", fill=(255, 200, 255))
+
+        # Strip annotations on the right edge (outlined)
+        y0_wnet = th_s + L_s
+        if wt_arr is not None:
+            _txt((W_s - 46, y0_wnet + 2),        "W_net",         fill=(150, 255, 180))
+            _txt((W_s - 46, y0_wnet + 12),       f"{w_vmax:.1f}", fill=(200, 200, 200))
+            _txt((W_s - 46, y0_wnet + sh_s - 9), f"{w_vmin:.1f}", fill=(200, 200, 200))
+            y0_T = y0_wnet + sh_s
+        else:
+            y0_T = y0_wnet
+
+        if tt_arr is not None:
+            _txt((W_s - 46, y0_T + 2),        "T(t)",          fill=(255, 200, 100))
+            _txt((W_s - 46, y0_T + 12),       f"{t_vmax:.1f}", fill=(200, 200, 200))
+            _txt((W_s - 46, y0_T + sh_s - 9), f"{t_vmin:.1f}", fill=(200, 200, 200))
+            y0_bot = y0_T + sh_s
+            _txt((W_s // 2 - 18, y0_bot + 2), "time \u2192",   fill=(200, 200, 200))
+
         pil_frames.append(img)
 
     buf = io.BytesIO()
