@@ -18,7 +18,7 @@ def run_exp1(config=None, results_dir='../results/exp1', n_generations=500):
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
     T_mean = cfg['T_mean']
-    J_init = T_mean / 2.269
+    J_init = 0.92  # T_mean / 2.269
 
     lambda_values = [0.0, 0.01, 0.1, 0.5]
     alpha_values = [0.05, 0.1, 0.3]
@@ -52,4 +52,4 @@ def run_exp1(config=None, results_dir='../results/exp1', n_generations=500):
 
 
 if __name__ == '__main__':
-    run_exp1(results_dir='../results/exp1_batched')
+    run_exp1(results_dir='../results/exp1_batched', n_generations=1000)

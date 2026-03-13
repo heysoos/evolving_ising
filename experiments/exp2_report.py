@@ -152,7 +152,8 @@ def fig_controller_strategy(params_flat, config):
     n = 40 * 40
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    # Controller inputs: [s_i, s_j, m_bar_i, T_norm, budget_norm]
+    # Controller inputs: [s_i, s_j, m_bar_i, T_norm, budget_norm, J_norm]
+    # J_norm fixed at 0 (J = J_crit) for the visualisation sweep
     for ax, (s_i_val, s_j_val, title) in zip(axes, [
         (+1, +1, 'Aligned  (s_i=+1, s_j=+1)'),
         (+1, -1, 'Anti-aligned  (s_i=+1, s_j=−1)'),
@@ -163,7 +164,8 @@ def fig_controller_strategy(params_flat, config):
             MM.ravel().astype(np.float32),
             TT.ravel().astype(np.float32),
             np.ones(n, dtype=np.float32),
-        ], axis=-1)  # (n, 5)
+            np.zeros(n, dtype=np.float32),   # J_norm = 0 → J at J_crit
+        ], axis=-1)  # (n, 6)
         dJ = np.asarray(controller.forward(x)).ravel().reshape(40, 40)
 
         vmax = delta_J_max
@@ -228,14 +230,16 @@ def fig_J_spatial(best_controller_npz, config):
         spins_np = np.asarray(spins[0], dtype=np.float32)  # (N,)
         m_bar = alpha_ema * spins_np + (1.0 - alpha_ema) * m_bar
 
-        # Build vectorized state: [s_i, s_j, m_bar_i, T_norm, budget_norm]
+        # Build vectorized state: [s_i, s_j, m_bar_i, T_norm, budget_norm, J_norm]
+        J_nk_norm = np.tanh(J_nk / J_c - 1.0)
         x = np.stack([
             spins_np[bond_i],
             spins_np[bond_j],
             m_bar[bond_i],
             np.full(N * K, T_n, dtype=np.float32),
             np.ones(N * K, dtype=np.float32),
-        ], axis=-1)  # (N*K, 5)
+            J_nk_norm.ravel(),
+        ], axis=-1)  # (N*K, 6)
 
         dJ_all = np.asarray(controller.forward(x)).ravel()  # (N*K,)
         dJ_nk = dJ_all.reshape(N, K)

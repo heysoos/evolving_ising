@@ -267,6 +267,8 @@ def fig_controller_strategy(params_flat, config):
         # For grid efficiency, build the full (N,5) input directly.
         import jax.numpy as jnp
 
+        J_norm_fixed = np.zeros(len(TT_flat), dtype=np.float32)  # J = J_crit
+
         def _run_grid(s_i, s_j):
             x = np.stack([
                 s_i.astype(np.float32),
@@ -274,6 +276,7 @@ def fig_controller_strategy(params_flat, config):
                 MM_flat.astype(np.float32),
                 TT_flat.astype(np.float32),
                 budget_fixed,
+                J_norm_fixed,
             ], axis=-1)
             x_jax = jnp.asarray(x)
             out = ctrl.forward(x_jax)  # (..., 1)
@@ -339,7 +342,8 @@ def fig_controller_budget_sensitivity(params_flat, config):
             s_i = np.full(n_pts, s_i_val, dtype=np.float32)
             s_j = np.full(n_pts, s_j_val, dtype=np.float32)
             t_arr = np.full(n_pts, t_norm, dtype=np.float32)
-            x = np.stack([s_i, s_j, m_bar_zero, t_arr, bud_vals], axis=-1)
+            J_norm_zero = np.zeros(n_pts, dtype=np.float32)  # J = J_crit
+            x = np.stack([s_i, s_j, m_bar_zero, t_arr, bud_vals, J_norm_zero], axis=-1)
             dJ = np.asarray(ctrl.forward(jnp.asarray(x))).ravel()
             ax.plot(bud_vals, dJ, color=color, linestyle=ls, linewidth=1.5,
                     label=label)
@@ -373,7 +377,7 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
         import jax
         import jax.numpy as jnp
         from evolving_ising.model import IsingModel
-        from work_extraction.controller import _mlp_forward
+        from work_extraction.controller import _mlp_forward, make_layer_specs
     except ImportError:
         return None
 
@@ -427,14 +431,9 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
         J_init_jax = jnp.full((N, K), J_init_val, dtype=jnp.float32) * mask_f
         params_jax = jnp.asarray(params_flat)
 
-        layer_specs = (
-            ('W1', (5, hidden_size)),
-            ('b1', (hidden_size,)),
-            ('W2', (hidden_size, hidden_size)),
-            ('b2', (hidden_size,)),
-            ('W3', (hidden_size, 1)),
-            ('b3', (1,)),
-        )
+        layer_specs = make_layer_specs(hidden_size)
+
+        J_crit = T_mean / 2.269   # critical coupling
 
         # --- Pure JAX bond budget closures (mirrors make_jax_eval_fn) ---
         def bud_init():
@@ -483,10 +482,11 @@ def _simulate_final_J(run_dir, config, n_cycles=5):
 
             T_norm   = (T_t - T_mean) / delta_T
             bud_vals = bud_get(bud_c, si, sk, sj)
-            bud_norm = jnp.tanh(bud_vals / B_scale)
+            bud_norm   = jnp.tanh(bud_vals / B_scale)
+            J_norm_arr = jnp.tanh(J_c[si, sk] / J_crit - 1.0)
             x = jnp.stack([s_aft_f[si], s_aft_f[sj], mag_c[si],
                            jnp.full(n_updates, T_norm, dtype=jnp.float32),
-                           bud_norm], axis=-1)
+                           bud_norm, J_norm_arr], axis=-1)
 
             dJ   = _mlp_forward(params_jax, x, layer_specs, delta_J_max).ravel()
             costs = jnp.abs(s_aft_f[si] * s_aft_f[sj] * dJ) + lam * jnp.abs(dJ)

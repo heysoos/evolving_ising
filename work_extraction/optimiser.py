@@ -15,7 +15,7 @@ from functools import partial
 from evolving_ising.optim import SeparableCMAES
 
 from .thermodynamics import CycleAccumulator, temperature_schedule
-from .controller import LocalController, LocalMagnetisationTracker, _mlp_forward
+from .controller import LocalController, LocalMagnetisationTracker, _mlp_forward, make_layer_specs
 from .budgets import BaseBudget, NoBudget
 
 
@@ -84,6 +84,9 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     num_sweeps = int(config.get('num_sweeps', 1))
     warmup_sweeps = int(config.get('warmup_sweeps', 500))
     J_init_val = float(config['J_init'])
+    J_init_lo  = float(config.get('J_init_lo', J_init_val))
+    J_init_hi  = float(config.get('J_init_hi', J_init_val))
+    J_crit     = T_mean / 2.269          # critical coupling (scalar constant)
     J_min = float(config['J_min'])
     J_max = float(config['J_max'])
     bond_update_frac = float(config['bond_update_frac'])
@@ -115,20 +118,11 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     valid_k_jax = jnp.asarray(valid_k_np, dtype=jnp.int32)
     valid_j_jax = jnp.asarray(valid_j_np, dtype=jnp.int32)
 
-    J_init_jax = jnp.full((N, K), J_init_val, dtype=jnp.float32) * mask_f
-
     # Effective neighbor count for diffusing budget Laplacian
     K_eff_jax = jnp.sum(mask_f, axis=1)  # (N,)
 
     # MLP layer specs (static Python tuple — used as static arg)
-    layer_specs = (
-        ('W1', (5, hidden_size)),
-        ('b1', (hidden_size,)),
-        ('W2', (hidden_size, hidden_size)),
-        ('b2', (hidden_size,)),
-        ('W3', (hidden_size, 1)),
-        ('b3', (1,)),
-    )
+    layer_specs = make_layer_specs(hidden_size)
 
     # --- Budget pure functions dispatched by budget_type ---
     # Each returns updated budget state; all are pure JAX functions.
@@ -231,7 +225,13 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     # params_flat as a JAX traced value (safe for vmap/jit).
 
     def _eval_fn(params_flat, key):
-        # Split keys
+        # Sample a random J_init for this chain from [J_init_lo, J_init_hi].
+        # When J_init_lo == J_init_hi the result is the fixed J_init_val.
+        key, j_key = jax.random.split(key)
+        j_val = jax.random.uniform(j_key, shape=(), minval=J_init_lo, maxval=J_init_hi)
+        J_init_local = jnp.full((N, K), j_val, dtype=jnp.float32) * mask_f
+
+        # Split remaining keys
         key, init_key, warmup_key = jax.random.split(key, 3)
 
         # Init spins
@@ -239,7 +239,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
 
         # Warmup at T_mean
         spins, _ = model.metropolis_checkerboard_sweeps(
-            warmup_key, spins, J_init_jax, T_mean, warmup_sweeps
+            warmup_key, spins, J_init_local, T_mean, warmup_sweeps
         )
 
         # Init budget and mag EMA
@@ -247,12 +247,10 @@ def make_jax_eval_fn(model, config, budget_type='none'):
         mag_ema = jnp.zeros(N, dtype=jnp.float32)
 
         # Outer cycle scan
-        cycle_carry_0 = (spins, key, J_init_jax, bud_state, mag_ema)
+        cycle_carry_0 = (spins, key, J_init_local, bud_state, mag_ema)
 
-        # We need params_flat accessible in step_fn — use a closure trick:
-        # redefine step_fn and cycle_fn inside _eval_fn so they close over
-        # params_flat. (Python closure — safe for JAX tracing since params_flat
-        # is a traced array.)
+        # _step_fn and _cycle_fn are defined inside _eval_fn so they close over
+        # params_flat as a JAX traced value (safe for vmap/jit).
 
         def _step_fn(carry, t):
             spins_c, key_c, J_c, bud_c, Q_in, Q_out, sigma, mag_c, E_carry = carry
@@ -284,7 +282,9 @@ def make_jax_eval_fn(model, config, budget_type='none'):
             bud_vals = bud_get(bud_c, si, sk, sj)
             bud_norm = jnp.tanh(bud_vals / B_scale)
             T_norm_arr = jnp.full(n_updates, T_norm, dtype=jnp.float32)
-            x = jnp.stack([s_i_vals, s_j_vals, m_bar, T_norm_arr, bud_norm], axis=-1)
+            J_norm_arr = jnp.tanh(J_c[si, sk] / J_crit - 1.0)
+            x = jnp.stack([s_i_vals, s_j_vals, m_bar, T_norm_arr, bud_norm,
+                            J_norm_arr], axis=-1)
 
             dJ = _mlp_forward(params_flat, x, layer_specs, delta_J_max).ravel()
             costs = jnp.abs(s_i_vals * s_j_vals * dJ) + lam * jnp.abs(dJ)

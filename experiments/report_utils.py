@@ -217,7 +217,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     """
     import jax
     import jax.numpy as jnp
-    from work_extraction.controller import _mlp_forward
+    from work_extraction.controller import _mlp_forward, make_layer_specs
 
     # ------------------------------------------------------------------ config
     L = config.get('L', 32)
@@ -240,6 +240,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     tau_mu = float(config.get('tau_mu', 20.0))
     spc = int(config.get('steps_per_cycle', 100)) if steps_per_cycle is None else steps_per_cycle
     T_norm_denom = delta_T if delta_T > 0 else 1.0
+    J_crit = T_mean / 2.269          # critical coupling (scalar)
 
     # ---------------------------------------------------- precomputed JAX arrays
     N = model.n
@@ -270,14 +271,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
 
     # Controller params as a JAX constant (None → controller code excluded at trace time)
     params_jax = jnp.asarray(params_flat, dtype=jnp.float32) if params_flat is not None else None
-    layer_specs = (
-        ('W1', (5, hidden_size)),
-        ('b1', (hidden_size,)),
-        ('W2', (hidden_size, hidden_size)),
-        ('b2', (hidden_size,)),
-        ('W3', (hidden_size, 1)),
-        ('b3', (1,)),
-    )
+    layer_specs = make_layer_specs(hidden_size)
 
     # ----------------------------------------- pure-JAX budget functions
     # Mirrors make_jax_eval_fn exactly so the budget dynamics are identical.
@@ -356,9 +350,11 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
             T_norm = (T_t - T_mean) / T_norm_denom
             bud_vals = bud_get(bud, si, sk, sj)
             bud_norm = jnp.tanh(bud_vals / B_scale)
+            J_norm_arr = jnp.tanh(J[si, sk] / J_crit - 1.0)
             x = jnp.stack([
                 s_aft_f[si], s_aft_f[sj], mag_ema[si],
                 jnp.full(n_updates, T_norm, dtype=jnp.float32), bud_norm,
+                J_norm_arr,
             ], axis=-1)
             dJ = _mlp_forward(params_jax, x, layer_specs, delta_J_max).ravel()
             costs = jnp.abs(s_aft_f[si] * s_aft_f[sj] * dJ) + lam * jnp.abs(dJ)

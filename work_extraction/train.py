@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     'T_mean': 2.5,
     'delta_T': 1.5,
     'tau': 200,
-    'J_init': 1.1,
+    'J_init': 0.92,
     'J_min': 0.01,
     'J_max': 5.0,
     'n_generations': 500,

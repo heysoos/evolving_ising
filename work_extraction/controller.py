@@ -55,6 +55,23 @@ def _mlp_forward_jit(params_flat, x, layer_specs, delta_J_max):
     return _mlp_forward(params_flat, x, layer_specs, delta_J_max)
 
 
+def make_layer_specs(hidden_size=8, input_size=6, output_size=1):
+    """Return the MLP layer spec tuple for use with _mlp_forward.
+
+    Centralised here so that optimiser.py, report scripts, and experiment
+    scripts all derive layer_specs from one source of truth rather than
+    reconstructing it manually.
+    """
+    return (
+        ('W1', (input_size, hidden_size)),
+        ('b1', (hidden_size,)),
+        ('W2', (hidden_size, hidden_size)),
+        ('b2', (hidden_size,)),
+        ('W3', (hidden_size, output_size)),
+        ('b3', (output_size,)),
+    )
+
+
 class LocalController:
     """Small MLP that proposes bond coupling changes.
 
@@ -62,7 +79,8 @@ class LocalController:
     Output is scaled to [-delta_J_max, delta_J_max] via tanh.
 
     Inputs per bond (i, j):
-        [s_i, s_j, m_bar_i, T_norm, budget_norm]
+        [s_i, s_j, m_bar_i, T_norm, budget_norm, J_norm]
+    where J_norm = tanh(J_ij / J_crit - 1), J_crit = T_mean / 2.269.
 
     The forward pass runs on GPU via JAX JIT. Parameters are stored as
     numpy for CMA-ES compatibility and converted to JAX on demand.
@@ -71,17 +89,10 @@ class LocalController:
     def __init__(self, delta_J_max=0.1, hidden_size=8):
         self.delta_J_max = delta_J_max
         self.hidden_size = hidden_size
-        self.input_size = 5
+        self.input_size = 6
         self.output_size = 1
 
-        self._layer_specs = (
-            ('W1', (self.input_size, hidden_size)),
-            ('b1', (hidden_size,)),
-            ('W2', (hidden_size, hidden_size)),
-            ('b2', (hidden_size,)),
-            ('W3', (hidden_size, self.output_size)),
-            ('b3', (self.output_size,)),
-        )
+        self._layer_specs = make_layer_specs(hidden_size, self.input_size, self.output_size)
 
         self.n_params = sum(
             int(np.prod(s)) for _, s in self._layer_specs
@@ -124,7 +135,7 @@ class LocalController:
         """Forward pass returning numpy (for compatibility)."""
         return np.asarray(self.forward(x))
 
-    def propose_updates(self, s_i, s_j, m_bar, T_norm, budget_norm):
+    def propose_updates(self, s_i, s_j, m_bar, T_norm, budget_norm, J_norm):
         """Propose bond coupling changes for a set of bonds.
 
         All inputs are converted to JAX arrays. Returns JAX array.
@@ -135,20 +146,22 @@ class LocalController:
         m_bar : array (n_bonds,)
         T_norm : float
         budget_norm : array (n_bonds,)
+        J_norm : array (n_bonds,)  tanh(J_ij / J_crit - 1)
 
         Returns
         -------
         delta_J : JAX array (n_bonds,)
         """
-        s_i = jnp.asarray(s_i, dtype=jnp.float32)
-        s_j = jnp.asarray(s_j, dtype=jnp.float32)
-        m_bar = jnp.asarray(m_bar, dtype=jnp.float32)
+        s_i        = jnp.asarray(s_i,        dtype=jnp.float32)
+        s_j        = jnp.asarray(s_j,        dtype=jnp.float32)
+        m_bar      = jnp.asarray(m_bar,      dtype=jnp.float32)
         budget_norm = jnp.asarray(budget_norm, dtype=jnp.float32)
+        J_norm     = jnp.asarray(J_norm,     dtype=jnp.float32)
 
         n = s_i.shape[0]
         T_arr = jnp.full(n, T_norm, dtype=jnp.float32)
 
-        x = jnp.stack([s_i, s_j, m_bar, T_arr, budget_norm], axis=-1)
+        x = jnp.stack([s_i, s_j, m_bar, T_arr, budget_norm, J_norm], axis=-1)
         return self.forward(x).ravel()
 
 
