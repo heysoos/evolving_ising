@@ -83,10 +83,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     n_eval_cycles = int(config['n_eval_cycles'])
     num_sweeps = int(config.get('num_sweeps', 1))
     warmup_sweeps = int(config.get('warmup_sweeps', 500))
-    J_init_val = float(config['J_init'])
-    J_init_lo  = float(config.get('J_init_lo', J_init_val))
-    J_init_hi  = float(config.get('J_init_hi', J_init_val))
-    J_crit     = T_mean / 2.269          # critical coupling (scalar constant)
+    J_crit = T_mean / 2.269          # critical coupling (scalar constant)
     J_min = float(config['J_min'])
     J_max = float(config['J_max'])
     bond_update_frac = float(config['bond_update_frac'])
@@ -224,11 +221,10 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     # _step_fn and _cycle_fn are defined inside _eval_fn so they close over
     # params_flat as a JAX traced value (safe for vmap/jit).
 
-    def _eval_fn(params_flat, key):
-        # Sample a random J_init for this chain from [J_init_lo, J_init_hi].
-        # When J_init_lo == J_init_hi the result is the fixed J_init_val.
-        key, j_key = jax.random.split(key)
-        j_val = jax.random.uniform(j_key, shape=(), minval=J_init_lo, maxval=J_init_hi)
+    def _eval_fn(params_flat, key, j_val):
+        # j_val is sampled at generation level (in train.py) and shared across
+        # all population members at a given chain index, so within-generation
+        # fitness differences reflect controller quality not J_init luck.
         J_init_local = jnp.full((N, K), j_val, dtype=jnp.float32) * mask_f
 
         # Split remaining keys

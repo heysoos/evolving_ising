@@ -111,7 +111,13 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
     print(f"\nOptimal: J0={J0_opt:.4f}, tau={tau_opt}, W_net={W_net_opt:.4f}")
     print(f"Expected J0_opt ≈ T_mean/2.269 = {T_mean/2.269:.4f}")
 
-    # Save results
+    # Save results — auto-rename if directory already exists
+    if os.path.exists(results_dir):
+        suffix = 1
+        while os.path.exists(f"{results_dir}_{suffix}"):
+            suffix += 1
+        results_dir = f"{results_dir}_{suffix}"
+        print(f"[exp0] Directory exists; saving to {results_dir}")
     os.makedirs(results_dir, exist_ok=True)
     np.savez(
         os.path.join(results_dir, 'sweep.npz'),

@@ -127,21 +127,28 @@ def run_experiment(config, budget_type='none', name='experiment',
     )
 
     # Build JAX eval function.
-    # If n_eval_chains > 1, average fitness over that many independent spin-chain
-    # runs per candidate.  The inner vmap over chains and the outer vmap over the
-    # population are fused by JAX into a single kernel of pop_size × n_eval_chains
-    # concurrent evaluations.
+    # j_val is sampled once per chain per generation and shared across all
+    # population members at that chain index, so within-generation fitness
+    # differences reflect controller quality rather than J_init luck.
     n_eval_chains = int(cfg.get('n_eval_chains', 1))
+    J_init_lo = float(cfg.get('J_init_lo', cfg['J_init']))
+    J_init_hi = float(cfg.get('J_init_hi', cfg['J_init']))
+
     eval_fn_base = make_jax_eval_fn(model, cfg, budget_type)
+    # eval_fn_base: (params_flat, key, j_val) -> scalar
+    # vmap over population; broadcast j_val (not vmapped)
+    _eval_pop = jax.vmap(eval_fn_base, in_axes=(0, 0, None))
 
     if n_eval_chains > 1:
-        def eval_fn(params_flat, key):
-            chain_keys = jax.random.split(key, n_eval_chains)
-            return jnp.mean(jax.vmap(lambda k: eval_fn_base(params_flat, k))(chain_keys))
+        def _eval_batch(params_batch, keys_by_chain, j_vals):
+            # keys_by_chain: (n_eval_chains, pop_size, key_shape)
+            # j_vals: (n_eval_chains,)
+            def _one_chain(keys_c, j_c):
+                return _eval_pop(params_batch, keys_c, j_c)
+            return jnp.mean(jax.vmap(_one_chain)(keys_by_chain, j_vals), axis=0)
+        eval_batch = jax.jit(_eval_batch)
     else:
-        eval_fn = eval_fn_base
-
-    eval_batch = jax.jit(jax.vmap(eval_fn))
+        eval_batch = jax.jit(_eval_pop)
 
     # Determine n_params from controller (same MLP architecture)
     controller = LocalController(
@@ -177,11 +184,22 @@ def run_experiment(config, budget_type='none', name='experiment',
     for gen in pbar:
         params_list = es.ask()
 
-        # Evaluate entire population in parallel via vmap+jit
+        # Evaluate entire population in parallel via vmap+jit.
+        # j_val(s) sampled here (generation level) and shared across pop members.
         params_batch = jnp.array(np.stack(params_list))
-        master_key, *eval_keys = jax.random.split(master_key, cfg['pop_size'] + 1)
-        keys_batch = jnp.stack(eval_keys)
-        fitnesses_jax = eval_batch(params_batch, keys_batch)
+        pop_size = cfg['pop_size']
+        if n_eval_chains > 1:
+            all_keys = jax.random.split(master_key, 2 + n_eval_chains * pop_size)
+            master_key, j_base_key = all_keys[0], all_keys[1]
+            j_vals = jax.random.uniform(
+                j_base_key, shape=(n_eval_chains,), minval=J_init_lo, maxval=J_init_hi)
+            keys_by_chain = all_keys[2:].reshape(n_eval_chains, pop_size, -1)
+            fitnesses_jax = eval_batch(params_batch, keys_by_chain, j_vals)
+        else:
+            all_keys = jax.random.split(master_key, 2 + pop_size)
+            master_key, j_base_key = all_keys[0], all_keys[1]
+            j_val = jax.random.uniform(j_base_key, shape=(), minval=J_init_lo, maxval=J_init_hi)
+            fitnesses_jax = eval_batch(params_batch, all_keys[2:], j_val)
         fitnesses = list(np.asarray(fitnesses_jax))
 
         es.tell(params_list, fitnesses)
@@ -228,8 +246,14 @@ def run_experiment(config, budget_type='none', name='experiment',
         best_params=best_ever_params if best_ever_params is not None else es.best_params,
     )
 
-    # Save to disk
+    # Save to disk — auto-rename if directory already exists
     save_dir = os.path.join(results_dir, name)
+    if os.path.exists(save_dir):
+        suffix = 1
+        while os.path.exists(f"{save_dir}_{suffix}"):
+            suffix += 1
+        save_dir = f"{save_dir}_{suffix}"
+        print(f"[train] Directory exists; saving to {save_dir}")
     os.makedirs(save_dir, exist_ok=True)
 
     np.savez(
