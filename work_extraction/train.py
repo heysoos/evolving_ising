@@ -29,8 +29,8 @@ DEFAULT_CONFIG = {
     'tau': 200,               # bath oscillation period in Metropolis steps
     # --- Coupling initialisation ---
     'J_init': 0.92,           # default scalar J used when J_init_lo == J_init_hi
-    'J_init_lo': 0.01,        # lower bound for per-chain J_init uniform sampling
-    'J_init_hi': 5.0,         # upper bound for per-chain J_init uniform sampling
+    'J_init_lo': 0.92,        # lower bound for per-chain J_init uniform sampling
+    'J_init_hi': 0.92,        # upper bound for per-chain J_init uniform sampling
     'J_min': 0.01,            # hard clamp lower bound on J during evolution
     'J_max': 5.0,             # hard clamp upper bound on J during evolution
     # --- Training schedule ---
@@ -62,6 +62,8 @@ DEFAULT_CONFIG = {
     'j_pool_size': 50,        # max J matrices stored in pool (0 = disabled)
     'j_random_frac': 0.2,     # fraction of chains using fresh random J_init each gen
     'j_pool_elite_frac': 0.3, # fraction of population whose J_final is added to pool
+    # --- Reproducibility ---
+    'seed': 0,                # master seed for JAX PRNG and CMA-ES numpy RNG
 }
 
 
@@ -228,15 +230,15 @@ def run_experiment(config, budget_type='none', name='experiment',
         n_params=controller.n_params,
         pop_size=cfg['pop_size'],
         sigma=cfg['sigma'],
-        seed=0,
+        seed=cfg['seed'],
     )
 
-    master_key = jax.random.PRNGKey(0)
+    master_key = jax.random.PRNGKey(cfg['seed'])
 
     # J pool setup
     pool = JPool(max_size=cfg.get('j_pool_size', 50), N=model.n, K=model.K)
     mask_np = np.asarray(model.mask, dtype=np.float32)
-    pool_rng = np.random.default_rng(42)
+    pool_rng = np.random.default_rng(cfg['seed'])
     j_random_frac = float(cfg.get('j_random_frac', 0.2))
     j_pool_elite_frac = float(cfg.get('j_pool_elite_frac', 0.3))
 
