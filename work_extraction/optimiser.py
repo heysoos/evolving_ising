@@ -14,9 +14,8 @@ from functools import partial
 
 from evolving_ising.optim import SeparableCMAES
 
-from .thermodynamics import CycleAccumulator, temperature_schedule
-from .controller import LocalController, LocalMagnetisationTracker, _mlp_forward, make_layer_specs
-from .budgets import BaseBudget, NoBudget
+from .controller import LocalController, _mlp_forward, make_layer_specs
+from .budgets import make_budget
 
 
 class WorkExtractionES:
@@ -89,13 +88,9 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     bond_update_frac = float(config['bond_update_frac'])
     lam = float(config['lambda'])
     B_scale = float(config['B_scale'])
-    budget_alpha = float(config.get('budget_alpha', config.get('mag_ema_alpha', 0.05)))
     mag_alpha = float(config.get('mag_ema_alpha', 0.05))
     delta_J_max = float(config['delta_J_max'])
     hidden_size = int(config['hidden_size'])
-    gamma = float(config.get('gamma', 0.25))
-    D_diff = float(config.get('D', 0.1))
-    tau_mu = float(config.get('tau_mu', 20.0))
 
     # --- Precomputed static arrays ---
     N = model.n
@@ -103,7 +98,6 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     neighbors_np = np.asarray(model.neighbors)   # (N, K) int
     mask_np = np.asarray(model.mask, dtype=bool)  # (N, K) bool
 
-    neighbors_jax = jnp.asarray(neighbors_np)    # (N, K) int32
     mask_f = jnp.asarray(mask_np, dtype=jnp.float32)  # (N, K)
 
     valid_i_np, valid_k_np = np.where(mask_np)
@@ -115,117 +109,20 @@ def make_jax_eval_fn(model, config, budget_type='none'):
     valid_k_jax = jnp.asarray(valid_k_np, dtype=jnp.int32)
     valid_j_jax = jnp.asarray(valid_j_np, dtype=jnp.int32)
 
-    # Effective neighbor count for diffusing budget Laplacian
-    K_eff_jax = jnp.sum(mask_f, axis=1)  # (N,)
-
     # MLP layer specs (static Python tuple — used as static arg)
     layer_specs = make_layer_specs(hidden_size)
 
-    # --- Budget pure functions dispatched by budget_type ---
-    # Each returns updated budget state; all are pure JAX functions.
-    # Budget state shapes:
-    #   'none':          (1,)   zeros, never used
-    #   'bond':          (N, K)
-    #   'neighbourhood': (N,)
-    #   'diffusing':     (N,)
-
-    if budget_type == 'none':
-        def bud_init():
-            return jnp.zeros(1, dtype=jnp.float32)
-
-        def bud_update(bud, s_bef, s_aft):
-            return bud
-
-        def bud_get(bud, si, sk, sj):
-            return jnp.full(n_updates, jnp.inf, dtype=jnp.float32)
-
-        def bud_spend(bud, si, sk, sj, costs, can_apply):
-            return bud
-
-    elif budget_type == 'bond':
-        def bud_init():
-            return jnp.zeros((N, K), dtype=jnp.float32)
-
-        def bud_update(bud, s_bef, s_aft):
-            # s_bef, s_aft: (N,) float32
-            nbr_bef = s_bef[neighbors_jax]    # (N, K)
-            nbr_aft = s_aft[neighbors_jax]
-            corr_bef = s_bef[:, None] * nbr_bef
-            corr_aft = s_aft[:, None] * nbr_aft
-            ordering = jnp.maximum(0.0, corr_aft - corr_bef) * mask_f
-            return bud + budget_alpha * ordering
-
-        def bud_get(bud, si, sk, sj):
-            return jnp.maximum(0.0, bud[si, sk])
-
-        def bud_spend(bud, si, sk, sj, costs, can_apply):
-            spend_amounts = jnp.where(can_apply, costs, 0.0)
-            bud = bud.at[si, sk].add(-spend_amounts)
-            return jnp.maximum(0.0, bud)
-
-    elif budget_type == 'neighbourhood':
-        def bud_init():
-            return jnp.zeros(N, dtype=jnp.float32)
-
-        def bud_update(bud, s_bef, s_aft):
-            nbr_bef = s_bef[neighbors_jax]
-            nbr_aft = s_aft[neighbors_jax]
-            corr_bef = s_bef[:, None] * nbr_bef
-            corr_aft = s_aft[:, None] * nbr_aft
-            ordering = jnp.maximum(0.0, corr_aft - corr_bef) * mask_f
-            return bud + budget_alpha * ordering.sum(axis=1)
-
-        def bud_get(bud, si, sk, sj):
-            nbr_budgets = bud[neighbors_jax] * mask_f           # (N, K)
-            nbhd = bud + gamma * nbr_budgets.sum(axis=1)         # (N,)
-            return jnp.minimum(nbhd[si], nbhd[sj])
-
-        def bud_spend(bud, si, sk, sj, costs, can_apply):
-            half = jnp.where(can_apply, costs / 2.0, 0.0)
-            bud = bud.at[si].add(-half)
-            bud = bud.at[sj].add(-half)
-            return jnp.maximum(0.0, bud)
-
-    elif budget_type == 'diffusing':
-        def bud_init():
-            return jnp.zeros(N, dtype=jnp.float32)
-
-        def bud_update(bud, s_bef, s_aft):
-            nbr_bef = s_bef[neighbors_jax]
-            nbr_aft = s_aft[neighbors_jax]
-            corr_bef = s_bef[:, None] * nbr_bef
-            corr_aft = s_aft[:, None] * nbr_aft
-            ordering = jnp.maximum(0.0, corr_aft - corr_bef) * mask_f
-            eta = budget_alpha * ordering.sum(axis=1)
-            nbr_mu = bud[neighbors_jax] * mask_f
-            laplacian = nbr_mu.sum(axis=1) - K_eff_jax * bud
-            bud = bud + D_diff * laplacian + eta - bud / tau_mu
-            return jnp.maximum(0.0, bud)
-
-        def bud_get(bud, si, sk, sj):
-            return jnp.minimum(
-                jnp.maximum(0.0, bud[si]),
-                jnp.maximum(0.0, bud[sj])
-            )
-
-        def bud_spend(bud, si, sk, sj, costs, can_apply):
-            half = jnp.where(can_apply, costs / 2.0, 0.0)
-            bud = bud.at[si].add(-half)
-            bud = bud.at[sj].add(-half)
-            return jnp.maximum(0.0, bud)
-
-    else:
-        raise ValueError(f"Unknown budget_type: {budget_type!r}")
+    # --- Budget object (pure-function interface used inside lax.scan) ---
+    budget = make_budget(budget_type, neighbors_np, mask_np, config)
 
     # --- eval_fn: JIT-compiled, vmappable ---
     # _step_fn and _cycle_fn are defined inside _eval_fn so they close over
     # params_flat as a JAX traced value (safe for vmap/jit).
 
-    def _eval_fn(params_flat, key, j_val):
-        # j_val is sampled at generation level (in train.py) and shared across
-        # all population members at a given chain index, so within-generation
-        # fitness differences reflect controller quality not J_init luck.
-        J_init_local = jnp.full((N, K), j_val, dtype=jnp.float32) * mask_f
+    def _eval_fn(params_flat, key, J_init_arr):
+        # J_init_arr: (N, K) float32, already masked — provided per population member
+        # by JPool in train.py so the controller learns to continue from adapted J states.
+        J_init_local = J_init_arr
 
         # Split remaining keys
         key, init_key, warmup_key = jax.random.split(key, 3)
@@ -239,7 +136,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
         )
 
         # Init budget and mag EMA
-        bud_state = bud_init()
+        bud_state = budget.init()
         mag_ema = jnp.zeros(N, dtype=jnp.float32)
 
         # Outer cycle scan
@@ -264,7 +161,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
 
             s_bef_f = jnp.mean(spins_bef.astype(jnp.float32), axis=0)
             s_aft_f = jnp.mean(spins_c.astype(jnp.float32), axis=0)
-            bud_c = bud_update(bud_c, s_bef_f, s_aft_f)
+            bud_c = budget.update_pure(bud_c, s_bef_f, s_aft_f)
 
             perm = jax.random.permutation(sub_b, n_bonds_total)[:n_updates]
             si = valid_i_jax[perm]
@@ -275,7 +172,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
             s_j_vals = s_aft_f[sj]
             m_bar = mag_c[si]
             T_norm = (T_t - T_mean) / delta_T
-            bud_vals = bud_get(bud_c, si, sk, sj)
+            bud_vals = budget.get_pure(bud_c, si, sk, sj)
             bud_norm = jnp.tanh(bud_vals / B_scale)
             T_norm_arr = jnp.full(n_updates, T_norm, dtype=jnp.float32)
             J_norm_arr = jnp.tanh(J_c[si, sk] / J_crit - 1.0)
@@ -289,7 +186,7 @@ def make_jax_eval_fn(model, config, budget_type='none'):
             dJ_gated = jnp.where(can_apply, dJ, 0.0)
             J_c = J_c.at[si, sk].add(dJ_gated)
             J_c = jnp.clip(J_c, J_min, J_max) * mask_f
-            bud_c = bud_spend(bud_c, si, sk, sj, costs, can_apply)
+            bud_c = budget.spend_pure(bud_c, si, sk, sj, costs, can_apply)
 
             E_post = jnp.mean(model.energy(J_c, spins_c))
             W_remodel_step = jnp.abs(E_post - E_after)
@@ -312,7 +209,8 @@ def make_jax_eval_fn(model, config, budget_type='none'):
             W_net = (Q_out - Q_in) - jnp.sum(W_remodels)
             return (spins_c, key_c, J_c, bud_c, mag_c), W_net
 
-        _, W_nets = jax.lax.scan(_cycle_fn, cycle_carry_0, None, length=n_eval_cycles)
-        return jnp.mean(W_nets)
+        final_carry, W_nets = jax.lax.scan(_cycle_fn, cycle_carry_0, None, length=n_eval_cycles)
+        J_final = final_carry[2]  # J_c is index 2 in (spins_c, key_c, J_c, bud_c, mag_c)
+        return jnp.mean(W_nets), J_final
 
     return jax.jit(_eval_fn)

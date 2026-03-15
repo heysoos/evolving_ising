@@ -8,9 +8,13 @@ Checks:
 
 import numpy as np
 import pytest
+import jax
+import jax.numpy as jnp
 
 from evolving_ising.model import IsingModel
-from work_extraction.budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
+from work_extraction.budgets import (
+    NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget, make_budget
+)
 
 
 @pytest.fixture
@@ -190,6 +194,93 @@ def test_bond_budget_update_is_vectorized(neighbors_mask):
 
     budget_arr = bb2.get_budget_array()
     assert budget_arr.sum() > 0, "Should have accumulated some budget"
+
+
+def test_pure_interface_lax_scan(neighbors_mask):
+    """update_pure / get_pure / spend_pure work inside jax.lax.scan for all budget types."""
+    neighbors, mask = neighbors_mask
+    N = neighbors.shape[0]
+    config = {'budget_alpha': 0.1, 'gamma': 0.25, 'D': 0.1, 'tau_mu': 20.0}
+    rng = np.random.default_rng(7)
+
+    # Small selection of bonds for get/spend
+    valid_i, valid_k = np.where(mask)
+    valid_j = neighbors[valid_i, valid_k]
+    n_upd = min(8, len(valid_i))
+    si = jnp.asarray(valid_i[:n_upd], dtype=jnp.int32)
+    sk = jnp.asarray(valid_k[:n_upd], dtype=jnp.int32)
+    sj = jnp.asarray(valid_j[:n_upd], dtype=jnp.int32)
+
+    s_steps = jnp.asarray(
+        rng.choice([-1.0, 1.0], size=(10, N)).astype(np.float32)
+    )  # (10, N)
+
+    for bt in ['none', 'bond', 'neighbourhood', 'diffusing']:
+        bud = make_budget(bt, neighbors, mask, config)
+
+        def _scan_step(carry, s_aft):
+            state, s_prev = carry
+            state = bud.update_pure(state, s_prev, s_aft)
+            bud_vals = bud.get_pure(state, si, sk, sj)
+            costs = jnp.full(n_upd, 0.01, dtype=jnp.float32)
+            can_apply = bud_vals >= costs
+            state = bud.spend_pure(state, si, sk, sj, costs, can_apply)
+            return (state, s_aft), bud_vals.sum()
+
+        init_s = s_steps[0]
+        init_carry = (bud.init(), init_s)
+        (final_state, _), totals = jax.lax.scan(_scan_step, init_carry, s_steps[1:])
+
+        # Verify non-negativity of final budget state
+        assert jnp.all(final_state >= 0.0), f"{bt}: negative budget after scan"
+        # Verify totals are finite (or inf for NoBudget)
+        if bt == 'none':
+            assert jnp.all(jnp.isinf(totals)), f"{bt}: expected inf"
+        else:
+            assert jnp.all(jnp.isfinite(totals)), f"{bt}: non-finite totals"
+
+
+def test_pure_interface_matches_stateful(neighbors_mask):
+    """update_pure accumulates non-negative budget matching stateful update."""
+    neighbors, mask = neighbors_mask
+    N = neighbors.shape[0]
+    config = {'budget_alpha': 0.1, 'gamma': 0.25, 'D': 0.0, 'tau_mu': 1e30}
+    rng = np.random.default_rng(99)
+
+    for bt in ['bond', 'neighbourhood', 'diffusing']:
+        bud = make_budget(bt, neighbors, mask, config)
+        state = bud.init()
+
+        for _ in range(20):
+            s_bef = jnp.asarray(rng.choice([-1.0, 1.0], size=N).astype(np.float32))
+            s_aft = jnp.asarray(rng.choice([-1.0, 1.0], size=N).astype(np.float32))
+            state = bud.update_pure(state, s_bef, s_aft)
+
+        assert jnp.all(state >= 0.0), f"{bt}: negative state after update_pure"
+        assert float(state.sum()) > 0.0, f"{bt}: state should be non-zero after updates"
+
+
+def test_make_budget_factory(neighbors_mask):
+    """make_budget factory creates correct types and init() returns correct shapes."""
+    neighbors, mask = neighbors_mask
+    N, K = neighbors.shape
+    config = {'budget_alpha': 0.05, 'gamma': 0.3, 'D': 0.2, 'tau_mu': 10.0}
+
+    cases = [
+        ('none',          NoBudget,              (1,)),
+        ('bond',          BondBudget,            (N, K)),
+        ('neighbourhood', NeighbourhoodBudget,   (N,)),
+        ('diffusing',     DiffusingBudget,       (N,)),
+    ]
+    for bt, expected_cls, expected_shape in cases:
+        b = make_budget(bt, neighbors, mask, config)
+        assert isinstance(b, expected_cls), f"{bt}: wrong type {type(b)}"
+        state = b.init()
+        assert state.shape == expected_shape, f"{bt}: init shape {state.shape} != {expected_shape}"
+        assert jnp.all(state == 0.0), f"{bt}: init state should be zero"
+
+    with pytest.raises(ValueError, match="Unknown budget_type"):
+        make_budget('invalid', neighbors, mask, config)
 
 
 if __name__ == "__main__":

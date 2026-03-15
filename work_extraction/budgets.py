@@ -70,6 +70,22 @@ class BaseBudget:
         """Spend by (site, slot). Default uses (i,j) spend."""
         self.spend_all(sel_i[apply_mask], sel_j[apply_mask], costs[apply_mask])
 
+    # --- Pure-function interface for jax.lax.scan ---
+    # These methods take state explicitly and return new state.
+    # Safe to use inside lax.scan; all operations are standard jnp.
+
+    def init(self):
+        raise NotImplementedError
+
+    def update_pure(self, state, s_bef, s_aft):
+        raise NotImplementedError
+
+    def get_pure(self, state, si, sk, sj):
+        raise NotImplementedError
+
+    def spend_pure(self, state, si, sk, sj, costs, can_apply):
+        raise NotImplementedError
+
 
 class NoBudget(BaseBudget):
     """Always returns inf budget. Used for Experiment 0 (no gating)."""
@@ -94,6 +110,18 @@ class NoBudget(BaseBudget):
 
     def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
         pass
+
+    def init(self):
+        return jnp.zeros(1, dtype=jnp.float32)
+
+    def update_pure(self, state, s_bef, s_aft):
+        return state
+
+    def get_pure(self, state, si, sk, sj):
+        return jnp.full(si.shape[0], jnp.inf, dtype=jnp.float32)
+
+    def spend_pure(self, state, si, sk, sj, costs, can_apply):
+        return state
 
 
 class BondBudget(BaseBudget):
@@ -164,6 +192,20 @@ class BondBudget(BaseBudget):
         self._budget = self._budget.at[sel_i, sel_k].add(-spend_amounts)
         self._budget = jnp.maximum(0.0, self._budget)
 
+    def init(self):
+        return jnp.zeros((self.N, self.K), dtype=jnp.float32)
+
+    def update_pure(self, state, s_bef, s_aft):
+        ordering = _compute_ordering(s_bef, s_aft, self.neighbors, self.mask)
+        return state + self.alpha * ordering
+
+    def get_pure(self, state, si, sk, sj):
+        return jnp.maximum(0.0, state[si, sk])
+
+    def spend_pure(self, state, si, sk, sj, costs, can_apply):
+        spend_amounts = jnp.where(can_apply, costs, 0.0)
+        return jnp.maximum(0.0, state.at[si, sk].add(-spend_amounts))
+
 
 class NeighbourhoodBudget(BaseBudget):
     """Site budgets pooled over neighbourhood (eq. 12).
@@ -220,6 +262,51 @@ class NeighbourhoodBudget(BaseBudget):
 
     def spend_all_nk(self, sel_i, sel_k, sel_j, costs, apply_mask):
         self.spend_all(sel_i[apply_mask], sel_j[apply_mask], costs[apply_mask])
+
+    def init(self):
+        return jnp.zeros(self.N, dtype=jnp.float32)
+
+    def update_pure(self, state, s_bef, s_aft):
+        ordering = _compute_ordering(s_bef, s_aft, self.neighbors, self.mask)
+        return state + self.alpha * ordering.sum(axis=1)
+
+    def get_pure(self, state, si, sk, sj):
+        nbhd = state + self.gamma * (state[self.neighbors] * self.mask).sum(axis=1)
+        return jnp.minimum(nbhd[si], nbhd[sj])
+
+    def spend_pure(self, state, si, sk, sj, costs, can_apply):
+        half = jnp.where(can_apply, costs / 2.0, 0.0)
+        return jnp.maximum(0.0, state.at[si].add(-half).at[sj].add(-half))
+
+
+def make_budget(budget_type, neighbors, mask, config):
+    """Instantiate the appropriate budget class from config.
+
+    Parameters
+    ----------
+    budget_type : str
+        One of 'none', 'bond', 'neighbourhood', 'diffusing'.
+    neighbors : array (N, K) int
+    mask : array (N, K) bool
+    config : dict
+
+    Returns
+    -------
+    BaseBudget instance.
+    """
+    alpha = float(config.get('budget_alpha', config.get('mag_ema_alpha', 0.05)))
+    if budget_type == 'none':
+        return NoBudget()
+    elif budget_type == 'bond':
+        return BondBudget(neighbors, mask, alpha=alpha)
+    elif budget_type == 'neighbourhood':
+        return NeighbourhoodBudget(neighbors, mask, alpha=alpha,
+                                   gamma=float(config.get('gamma', 0.25)))
+    elif budget_type == 'diffusing':
+        return DiffusingBudget(neighbors, mask, alpha=alpha,
+                               D=float(config.get('D', 0.1)),
+                               tau_mu=float(config.get('tau_mu', 20.0)))
+    raise ValueError(f"Unknown budget_type: {budget_type!r}")
 
 
 class DiffusingBudget(BaseBudget):
@@ -287,3 +374,19 @@ class DiffusingBudget(BaseBudget):
     def get_field(self):
         """Return the chemical potential field (N,) as numpy."""
         return np.maximum(0.0, np.asarray(self._mu))
+
+    def init(self):
+        return jnp.zeros(self.N, dtype=jnp.float32)
+
+    def update_pure(self, state, s_bef, s_aft):
+        ordering = _compute_ordering(s_bef, s_aft, self.neighbors, self.mask)
+        eta = self.alpha * ordering.sum(axis=1)
+        laplacian = (state[self.neighbors] * self.mask).sum(axis=1) - self._K_eff * state
+        return jnp.maximum(0.0, state + self.D * laplacian + eta - state / self.tau_mu)
+
+    def get_pure(self, state, si, sk, sj):
+        return jnp.minimum(jnp.maximum(0.0, state[si]), jnp.maximum(0.0, state[sj]))
+
+    def spend_pure(self, state, si, sk, sj, costs, can_apply):
+        half = jnp.where(can_apply, costs / 2.0, 0.0)
+        return jnp.maximum(0.0, state.at[si].add(-half).at[sj].add(-half))

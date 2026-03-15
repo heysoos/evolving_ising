@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current Plan
+
+See **[PLAN.md](PLAN.md)** for the current implementation status and upcoming phases.
+
 ## Project Overview
 
 This project simulates and evolves Thermally Diffusing Ising models using genetic algorithms (CMA-ES). The original goal was to optimize spin connectivity weights `J_nk` to maximize heat transport; the extended goal (work extraction) is to evolve a local controller that adapts `J` in response to spin state to extract thermodynamic work from an oscillating bath.
@@ -32,8 +36,13 @@ python run_experiments.py
 # Work extraction experiments
 python experiments/exp0_baseline.py
 python experiments/exp1_bond_budget.py
+python experiments/exp1b_long_run.py
 python experiments/exp2_nbhd_budget.py
 python experiments/exp3_diffuse.py
+
+# HTML reports (add --no-animate to skip GIF generation)
+python experiments/exp1_report.py
+python experiments/exp1_report.py --no-animate
 
 # Tests
 pytest tests/
@@ -86,8 +95,11 @@ analysis.py        plotting/analysis functions; runs as script to regenerate all
 ```
 exp0_baseline.py    Sweep J0/tau at fixed J; establish W_net ceiling
 exp1_bond_budget.py Evolve controller with BondBudget; sweep lambda, alpha
+exp1b_long_run.py   Long-run diagnostic: 500-cycle validation of trained controller
 exp2_nbhd_budget.py NeighbourhoodBudget; sweep gamma and tau
 exp3_diffuse.py     DiffusingBudget; sweep D, tau_mu; compute Lambda = D*tau_mu/xi^2
+report_utils.py     Shared report utilities: CSS, fig_to_b64, canvas charts, GIF gen
+exp{0,1,1b,2,3}_report.py  Per-experiment HTML report generators
 ```
 
 ### `tests/` — pytest tests
@@ -124,6 +136,10 @@ budget.spend(i,j,cost)             # gate updates
     |
 J_nk updated → WorkExtractionES.tell(params, W_net)
 ```
+
+Controller MLP: **6→8→8→1** (137 params)
+Inputs: `[s_i, s_j, m_bar_i, T_norm, budget_norm, J_norm_ij]`
+where `J_norm_ij = tanh(J_ij/J_crit - 1)`
 
 ## Important Conventions
 

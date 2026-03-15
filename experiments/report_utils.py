@@ -162,24 +162,6 @@ def load_run(run_dir):
 # Simulation loop for animation frames
 # ---------------------------------------------------------------------------
 
-def _make_budget(budget_type, neighbors_np, mask_np, config):
-    """Instantiate the appropriate budget class from config."""
-    from work_extraction.budgets import NoBudget, BondBudget, NeighbourhoodBudget, DiffusingBudget
-    alpha = float(config.get('budget_alpha', config.get('mag_ema_alpha', 0.05)))
-    if budget_type == 'none':
-        return NoBudget()
-    elif budget_type == 'bond':
-        return BondBudget(neighbors_np, mask_np, alpha=alpha)
-    elif budget_type == 'neighbourhood':
-        gamma = float(config.get('gamma', 0.25))
-        return NeighbourhoodBudget(neighbors_np, mask_np, alpha=alpha, gamma=gamma)
-    elif budget_type == 'diffusing':
-        D = float(config.get('D', 0.1))
-        tau_mu = float(config.get('tau_mu', 20.0))
-        return DiffusingBudget(neighbors_np, mask_np, alpha=alpha, D=D, tau_mu=tau_mu)
-    else:
-        raise ValueError(f'Unknown budget_type: {budget_type!r}')
-
 
 def run_anim_frames(model, config, budget_type='none', params_flat=None,
                     n_cycles=3, steps_per_cycle=None, frame_skip=2,
@@ -218,6 +200,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     import jax
     import jax.numpy as jnp
     from work_extraction.controller import _mlp_forward, make_layer_specs
+    from work_extraction.budgets import make_budget as _make_budget_fn
 
     # ------------------------------------------------------------------ config
     L = config.get('L', 32)
@@ -234,10 +217,6 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     bond_update_frac = float(config.get('bond_update_frac', 0.1))
     B_scale = float(config.get('B_scale', 2.0))
     num_sweeps = int(config.get('num_sweeps', 1))
-    budget_alpha = float(config.get('budget_alpha', config.get('mag_ema_alpha', 0.05)))
-    gamma = float(config.get('gamma', 0.25))
-    D_diff = float(config.get('D', 0.1))
-    tau_mu = float(config.get('tau_mu', 20.0))
     spc = int(config.get('steps_per_cycle', 100)) if steps_per_cycle is None else steps_per_cycle
     T_norm_denom = delta_T if delta_T > 0 else 1.0
     J_crit = T_mean / 2.269          # critical coupling (scalar)
@@ -248,8 +227,6 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     neighbors_np = np.asarray(model.neighbors)
     mask_np = np.asarray(model.mask, dtype=bool)
     mask_f = jnp.asarray(mask_np, dtype=jnp.float32)
-    neighbors_jax = jnp.asarray(neighbors_np, dtype=jnp.int32)
-    K_eff_jax = jnp.sum(mask_f, axis=1)
 
     valid_i_np, valid_k_np = np.where(mask_np)
     valid_j_np = neighbors_np[valid_i_np, valid_k_np]
@@ -273,59 +250,9 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     params_jax = jnp.asarray(params_flat, dtype=jnp.float32) if params_flat is not None else None
     layer_specs = make_layer_specs(hidden_size)
 
-    # ----------------------------------------- pure-JAX budget functions
-    # Mirrors make_jax_eval_fn exactly so the budget dynamics are identical.
-    if budget_type == 'none':
-        def bud_init(): return jnp.zeros(1, dtype=jnp.float32)
-        def bud_update(bud, s_bef, s_aft): return bud
-        def bud_get(bud, si, sk, sj): return jnp.full(n_updates, jnp.inf, dtype=jnp.float32)
-        def bud_spend(bud, si, sk, sj, costs, mask): return bud
-
-    elif budget_type == 'bond':
-        def bud_init(): return jnp.zeros((N, K), dtype=jnp.float32)
-        def bud_update(bud, s_bef, s_aft):
-            ordering = jnp.maximum(
-                0.0, s_aft[:, None] * s_aft[neighbors_jax]
-                   - s_bef[:, None] * s_bef[neighbors_jax]
-            ) * mask_f
-            return bud + budget_alpha * ordering
-        def bud_get(bud, si, sk, sj): return jnp.maximum(0.0, bud[si, sk])
-        def bud_spend(bud, si, sk, sj, costs, mask):
-            return jnp.maximum(0.0, bud.at[si, sk].add(-jnp.where(mask, costs, 0.0)))
-
-    elif budget_type == 'neighbourhood':
-        def bud_init(): return jnp.zeros(N, dtype=jnp.float32)
-        def bud_update(bud, s_bef, s_aft):
-            ordering = jnp.maximum(
-                0.0, s_aft[:, None] * s_aft[neighbors_jax]
-                   - s_bef[:, None] * s_bef[neighbors_jax]
-            ) * mask_f
-            return bud + budget_alpha * ordering.sum(axis=1)
-        def bud_get(bud, si, sk, sj):
-            nbhd = bud + gamma * (bud[neighbors_jax] * mask_f).sum(axis=1)
-            return jnp.minimum(nbhd[si], nbhd[sj])
-        def bud_spend(bud, si, sk, sj, costs, mask):
-            half = jnp.where(mask, costs / 2.0, 0.0)
-            return jnp.maximum(0.0, bud.at[si].add(-half).at[sj].add(-half))
-
-    elif budget_type == 'diffusing':
-        def bud_init(): return jnp.zeros(N, dtype=jnp.float32)
-        def bud_update(bud, s_bef, s_aft):
-            ordering = jnp.maximum(
-                0.0, s_aft[:, None] * s_aft[neighbors_jax]
-                   - s_bef[:, None] * s_bef[neighbors_jax]
-            ) * mask_f
-            eta = budget_alpha * ordering.sum(axis=1)
-            laplacian = (bud[neighbors_jax] * mask_f).sum(axis=1) - K_eff_jax * bud
-            return jnp.maximum(0.0, bud + D_diff * laplacian + eta - bud / tau_mu)
-        def bud_get(bud, si, sk, sj):
-            return jnp.minimum(jnp.maximum(0.0, bud[si]), jnp.maximum(0.0, bud[sj]))
-        def bud_spend(bud, si, sk, sj, costs, mask):
-            half = jnp.where(mask, costs / 2.0, 0.0)
-            return jnp.maximum(0.0, bud.at[si].add(-half).at[sj].add(-half))
-
-    else:
-        raise ValueError(f'Unknown budget_type: {budget_type!r}')
+    # ----------------------------------------- budget object (pure-function interface)
+    # Delegates to budgets.py so budget dynamics are identical to make_jax_eval_fn.
+    budget = _make_budget_fn(budget_type, neighbors_np, mask_np, config)
 
     # ----------------------------------------- inner step function (lax.scan body)
     # Python `if params_jax is not None` is evaluated at trace time, so the
@@ -339,7 +266,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
         E_after = jnp.mean(model.energy(J, spins))
         dE = E_after - E_prev
         running_wnet = running_wnet + jnp.maximum(-dE, 0.0) - jnp.maximum(dE, 0.0)
-        bud = bud_update(bud, s_bef_f, s_aft_f)
+        bud = budget.update_pure(bud, s_bef_f, s_aft_f)
         mag_ema = mag_alpha * s_aft_f + (1.0 - mag_alpha) * mag_ema
 
         if params_jax is not None:
@@ -348,7 +275,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
             sk = valid_k_jax[perm]
             sj = valid_j_jax[perm]
             T_norm = (T_t - T_mean) / T_norm_denom
-            bud_vals = bud_get(bud, si, sk, sj)
+            bud_vals = budget.get_pure(bud, si, sk, sj)
             bud_norm = jnp.tanh(bud_vals / B_scale)
             J_norm_arr = jnp.tanh(J[si, sk] / J_crit - 1.0)
             x = jnp.stack([
@@ -360,7 +287,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
             costs = jnp.abs(s_aft_f[si] * s_aft_f[sj] * dJ) + lam * jnp.abs(dJ)
             can_apply = bud_vals >= costs
             J = jnp.clip(J.at[si, sk].add(jnp.where(can_apply, dJ, 0.0)), J_min, J_max) * mask_f
-            bud = bud_spend(bud, si, sk, sj, costs, can_apply)
+            bud = budget.spend_pure(bud, si, sk, sj, costs, can_apply)
             E_after = jnp.mean(model.energy(J, spins))  # re-evaluate after J update
 
         return (spins, key, J, bud, mag_ema, running_wnet, E_after), None
@@ -397,7 +324,7 @@ def run_anim_frames(model, config, budget_type='none', params_flat=None,
     @jax.jit
     def _run_all(spins, key):
         init = (
-            spins, key, J_init_jax, bud_init(),
+            spins, key, J_init_jax, budget.init(),
             jnp.zeros(N, dtype=jnp.float32),  # mag_ema
             jnp.float32(0.0),                  # running_wnet
         )

@@ -52,4 +52,4 @@ def run_exp1(config=None, results_dir='../results/exp1', n_generations=500):
 
 
 if __name__ == '__main__':
-    run_exp1(results_dir='../results/exp1_batched', n_generations=1000)
+    run_exp1(results_dir='../results/exp1_Jpool', n_generations=1000)
