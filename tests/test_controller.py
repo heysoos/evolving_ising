@@ -40,8 +40,8 @@ def test_output_bounds():
     params = rng.standard_normal(ctrl.n_params).astype(np.float32) * 5.0
     ctrl.set_params(params)
 
-    # Generate 10,000 random inputs
-    x = rng.standard_normal((10000, 5)).astype(np.float32)
+    # Generate 10,000 random inputs (6 features: s_i, s_j, m_bar, T_norm, budget_norm, J_norm)
+    x = rng.standard_normal((10000, 6)).astype(np.float32)
     out = np.asarray(ctrl.forward(x))
 
     assert out.shape == (10000, 1)
@@ -52,8 +52,8 @@ def test_output_bounds():
 def test_param_count():
     """Parameter count matches architecture."""
     ctrl = LocalController(delta_J_max=0.1, hidden_size=8)
-    # 5*8 + 8 + 8*8 + 8 + 8*1 + 1 = 40 + 8 + 64 + 8 + 8 + 1 = 129
-    assert ctrl.n_params == 129
+    # 6*8 + 8 + 8*8 + 8 + 8*1 + 1 = 48 + 8 + 64 + 8 + 8 + 1 = 137
+    assert ctrl.n_params == 137
 
 
 def test_propose_updates():
@@ -68,7 +68,8 @@ def test_propose_updates():
     m_bar = rng.standard_normal(n_bonds).astype(np.float32) * 0.5
     budget_norm = rng.uniform(-1, 1, size=n_bonds).astype(np.float32)
 
-    delta_J = np.asarray(ctrl.propose_updates(s_i, s_j, m_bar, T_norm=0.5, budget_norm=budget_norm))
+    J_norm = rng.uniform(-1, 1, size=n_bonds).astype(np.float32)
+    delta_J = np.asarray(ctrl.propose_updates(s_i, s_j, m_bar, T_norm=0.5, budget_norm=budget_norm, J_norm=J_norm))
     assert delta_J.shape == (n_bonds,)
     assert np.all(np.abs(delta_J) <= 0.1)
 
