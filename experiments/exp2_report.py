@@ -30,14 +30,16 @@ from report_utils import (  # noqa: E402
     config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
-    canvas_chart_html,
     scenario_selector_html,
     gif_tag as _gif_tag,
     PALETTE,
+    fig_to_plotly_div,
+    plotly_training_curves,
+    plotly_sigma,
+    collapsible_section as _collapsible,
 )
 
 _EXPLANATION = """
-<h2>1. About This Experiment</h2>
 <div class="card">
   <h3>Physical Setup</h3>
   <p>Same oscillating bath as Experiments 0 and 1:
@@ -77,61 +79,72 @@ _EXPLANATION = """
 
 
 def fig_learning_curves(runs_gamma, gamma_values, baseline_W=11.86):
-    """One subplot per gamma, W_net (best per gen) vs generation."""
-    n = len(gamma_values)
-    fig, axes = plt.subplots(1, n, figsize=(3.5 * n, 4), sharey=True)
-    if n == 1:
-        axes = [axes]
-    cmap = matplotlib.colormaps['viridis'].resampled(n)
-
-    for ax, gamma, color in zip(axes, gamma_values, [cmap(i) for i in range(n)]):
+    """All gamma training curves as a Plotly figure; returns plotly div string."""
+    series = []
+    for idx, gamma in enumerate(gamma_values):
         key = f'gamma_{gamma:.2f}'
         log, _ = runs_gamma.get(key, (None, None))
-        if log is not None:
-            gens = log['generation']
-            best = log['best_fitness']
-            ax.plot(gens, best, color=color, lw=1.6)
-            ax.fill_between(gens, log['mean_fitness'], best, alpha=0.15, color=color)
-        ax.axhline(baseline_W, color='tomato', ls='--', lw=1.2, label='Exp0 baseline')
-        ax.set_title(f'γ = {gamma:.2f}', fontsize=10)
-        ax.set_xlabel('Generation')
-        if ax is axes[0]:
-            ax.set_ylabel('W_net')
-        ax.legend(fontsize=7)
-
-    fig.suptitle('Learning Curves — W_net vs Generation by γ', fontsize=12, y=1.02)
-    fig.tight_layout()
-    return _fig_to_b64(fig)
+        if log is None:
+            continue
+        gens = list(log['generation'].astype(int))
+        best = list(log['best_fitness'].astype(float))
+        series.append({
+            'label': f'γ={gamma:.2f}', 'x': gens, 'y': best,
+            'color': PALETTE[idx % len(PALETTE)],
+        })
+    fig = plotly_training_curves(
+        series, baseline=baseline_W,
+        title='Learning Curves — W_net vs Generation by γ',
+        xlabel='Generation', ylabel='W_net',
+    )
+    return fig_to_plotly_div(fig, include_plotlyjs='cdn')
 
 
 def fig_gamma_sweep(gamma_values, best_per_gamma, best_gamma, baseline_W=11.86):
-    """Bar chart of best W_net per gamma."""
-    fig, ax = plt.subplots(figsize=(7, 4))
+    """Bar chart of best W_net per gamma; returns plotly div string."""
+    try:
+        import plotly.graph_objects as _go
+    except ImportError:
+        return ''
     colors = ['seagreen' if g == best_gamma else 'steelblue' for g in gamma_values]
-    bars = ax.bar([f'{g:.2f}' for g in gamma_values], best_per_gamma, color=colors, alpha=0.85)
-    ax.axhline(baseline_W, color='tomato', ls='--', lw=1.4, label=f'Exp0 baseline ({baseline_W:.2f})')
-    ax.set_xlabel('γ')
-    ax.set_ylabel('Best W_net (final)')
-    ax.set_title('W_net vs Neighbourhood Pooling Strength γ')
-    ax.legend(fontsize=9)
-    for bar, val in zip(bars, best_per_gamma):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                f'{val:.1f}', ha='center', va='bottom', fontsize=8)
-    fig.tight_layout()
-    return _fig_to_b64(fig)
+    fig = _go.Figure(_go.Bar(
+        x=[f'{g:.2f}' for g in gamma_values], y=best_per_gamma,
+        marker_color=colors, text=[f'{v:.1f}' for v in best_per_gamma],
+        textposition='outside',
+        hovertemplate='γ=%{x}<br>W_net=%{y:.3f}<extra></extra>',
+    ))
+    fig.add_hline(y=baseline_W, line_dash='dash', line_color='tomato',
+                  annotation_text=f'baseline {baseline_W:.2f}',
+                  annotation_position='bottom right')
+    fig.update_layout(
+        title='W_net vs Neighbourhood Pooling Strength γ',
+        xaxis_title='γ', yaxis_title='Best W_net (final)',
+        margin=dict(l=60, r=20, t=80, b=40), height=350, template='plotly_white',
+    )
+    return fig_to_plotly_div(fig, include_plotlyjs=False)
 
 
 def fig_tau_sweep(tau_values, best_per_tau, best_gamma, baseline_W=11.86):
-    """Bar chart of best W_net per tau at best gamma."""
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar([str(t) for t in tau_values], best_per_tau, color='darkorange', alpha=0.85)
-    ax.axhline(baseline_W, color='tomato', ls='--', lw=1.4, label=f'Exp0 baseline ({baseline_W:.2f})')
-    ax.set_xlabel('τ (cycle period)')
-    ax.set_ylabel('Best W_net (final)')
-    ax.set_title(f'W_net vs τ  (γ = {best_gamma:.2f})')
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    return _fig_to_b64(fig)
+    """Bar chart of best W_net per tau; returns plotly div string."""
+    try:
+        import plotly.graph_objects as _go
+    except ImportError:
+        return ''
+    fig = _go.Figure(_go.Bar(
+        x=[str(t) for t in tau_values], y=best_per_tau,
+        marker_color='darkorange', text=[f'{v:.1f}' for v in best_per_tau],
+        textposition='outside',
+        hovertemplate='τ=%{x}<br>W_net=%{y:.3f}<extra></extra>',
+    ))
+    fig.add_hline(y=baseline_W, line_dash='dash', line_color='tomato',
+                  annotation_text=f'baseline {baseline_W:.2f}',
+                  annotation_position='bottom right')
+    fig.update_layout(
+        title=f'W_net vs τ  (γ = {best_gamma:.2f})',
+        xaxis_title='τ (cycle period)', yaxis_title='Best W_net (final)',
+        margin=dict(l=60, r=20, t=80, b=40), height=350, template='plotly_white',
+    )
+    return fig_to_plotly_div(fig, include_plotlyjs=False)
 
 
 def fig_controller_strategy(params_flat, config):
@@ -332,20 +345,23 @@ def generate_report(results_dir='results/exp2', out=None,
         'lambda': 0.01, 'budget_alpha': 0.1, 'gamma': best_gamma,
     }
 
-    figs = {}
+    plotly_figs = {}
     try:
-        figs['curves'] = fig_learning_curves(runs_gamma, gamma_values, baseline_W)
+        plotly_figs['curves'] = fig_learning_curves(runs_gamma, gamma_values, baseline_W)
     except Exception as e:
         print(f'  Warning: learning curves failed: {e}')
     try:
-        figs['gamma_sweep'] = fig_gamma_sweep(gamma_values, best_per_gamma, best_gamma, baseline_W)
+        plotly_figs['gamma_sweep'] = fig_gamma_sweep(gamma_values, best_per_gamma, best_gamma, baseline_W)
     except Exception as e:
         print(f'  Warning: gamma sweep figure failed: {e}')
     if any(not np.isnan(v) for v in best_per_tau):
         try:
-            figs['tau_sweep'] = fig_tau_sweep(tau_values, best_per_tau, best_gamma, baseline_W)
+            plotly_figs['tau_sweep'] = fig_tau_sweep(tau_values, best_per_tau, best_gamma, baseline_W)
         except Exception as e:
             print(f'  Warning: tau sweep figure failed: {e}')
+
+    # Static matplotlib figures (controller strategy, J spatial)
+    figs = {}
     if best_ctrl is not None:
         try:
             figs['strategy'] = fig_controller_strategy(best_ctrl['params'], config)
@@ -364,26 +380,12 @@ def generate_report(results_dir='results/exp2', out=None,
             parts.append(f'<p class="caption">{caption}</p>')
         return '\n'.join(parts)
 
-    # --- Interactive canvas chart (gamma sweep training curves) ---
-    chart_series = []
-    for idx, gamma in enumerate(gamma_values):
-        key = f'gamma_{gamma:.2f}'
-        log, _ = runs_gamma.get(key, (None, None))
-        if log is None:
-            continue
-        bh = log['best_fitness']
-        chart_series.append({
-            'label': f'γ={gamma:.2f}',
-            'x': list(range(len(bh))),
-            'y': [float(v) for v in bh],
-            'color': PALETTE[idx % len(PALETTE)],
-        })
-    interactive_curves_html = canvas_chart_html(
-        chart_series, 'exp2_curves',
-        title='Training Curves — W_net vs Generation by γ (hover to inspect)',
-        xlabel='Generation', ylabel='W_net',
-        baseline=baseline_W,
-    )
+    def pdiv(key):
+        val = plotly_figs.get(key, '')
+        return f'<div class="card">{val}</div>' if val else ''
+
+    # (interactive curves now in plotly_figs['curves'])
+    interactive_curves_html = plotly_figs.get('curves', '')
 
     # --- Per-gamma scenario panels ---
     model_shared = None
@@ -487,9 +489,9 @@ def generate_report(results_dir='results/exp2', out=None,
 <h1>Experiment 2 — Neighbourhood Budget</h1>
 <p class="meta">Generated: {ts} · Results: {os.path.abspath(results_dir)}</p>
 
-{_EXPLANATION}
+{_collapsible('1. About This Experiment', _EXPLANATION, open=False)}
 
-<h2>2. Key Results</h2>
+{_collapsible('2. Key Results', f'''
 <div class="card">
   <div class="highlight">
     <strong>Best γ:</strong> {best_gamma:.2f} →
@@ -500,42 +502,38 @@ def generate_report(results_dir='results/exp2', out=None,
     <tr><th>γ</th><th>Best W_net</th><th>Beats Exp0 baseline?</th></tr>
     {rows}
   </table>
-</div>
+</div>''')}
 
-<h2>3. Learning Curves</h2>
-{img('curves', 'W_net (best-ever and generation mean, shaded) vs generation for each γ value. Dashed red line is the Exp0 fixed-J ceiling. Runs that converge above the baseline demonstrate genuine advantage from neighbourhood budget sharing.')}
+{_collapsible('3. Learning Curves',
+    '<p class="caption">W_net (best per generation) for each γ value. Hover to inspect values; click legend to toggle runs. Dashed red line is the Exp0 fixed-J ceiling.</p>'
+    + f'<div class="card">{interactive_curves_html}</div>')}
 
-<h2>3b. Interactive Training Curves</h2>
-<div class="card">
-  <p>Hover to inspect values at any generation. Click buttons to toggle individual γ runs.</p>
-  {interactive_curves_html}
-</div>
+{_collapsible('4. W_net vs γ',
+    '<p class="caption">Best W_net achieved for each γ. The green bar marks the optimal γ*.</p>'
+    + pdiv('gamma_sweep'))}
 
-<h2>4. W_net vs γ</h2>
-{img('gamma_sweep', 'Best W_net achieved (across 500 generations) for each γ. The green bar marks the optimal γ*. A non-monotonic pattern (peak at intermediate γ) would confirm the spatial-correlation hypothesis.')}
+{_collapsible(f'5. Tau Sensitivity at γ* = {best_gamma:.2f}',
+    f'<p class="caption">Best W_net vs oscillation period τ at the best γ* = {best_gamma:.2f}.</p>'
+    + pdiv('tau_sweep'))}
 
-<h2>5. Tau Sensitivity at γ* = {best_gamma:.2f}</h2>
-{img('tau_sweep', f'Best W_net vs oscillation period τ at the best γ* = {best_gamma:.2f}. If the optimal γ is set by the static correlation length, performance should be relatively insensitive to τ.')}
-
-<h2>6. Controller Strategy Analysis</h2>
+{_collapsible('6. Controller Strategy Analysis', f'''
 <div class="card">
   <p>The controller MLP maps local state (T_norm, m̄, s_i·s_j, (s_i·s_j)·m̄, budget_norm) → δJ.
   By sweeping (T_norm, m̄) at fixed budget and bond alignment, we can read off the thermodynamic
   strategy the controller has learned without re-running the simulation.</p>
 </div>
-{img('strategy', 'Heatmap of proposed δJ as a function of normalised temperature T_norm (x-axis) and local magnetisation EMA m̄ (y-axis). Left: aligned bonds (s_i·s_j = +1). Right: anti-aligned bonds. Blue = strengthen coupling, red = weaken it. A rational strategy would strengthen bonds during the hot phase when domain walls form, and weaken during the cold phase.')}
+{img("strategy", "Heatmap of proposed δJ as a function of normalised temperature T_norm (x-axis) and local magnetisation EMA m̄ (y-axis). Left: aligned bonds (s_i·s_j = +1). Right: anti-aligned bonds. Blue = strengthen coupling, red = weaken it. A rational strategy would strengthen bonds during the hot phase when domain walls form, and weaken during the cold phase.")}''')}
 
-<h2>7. Connectivity Analysis</h2>
-{img('j_spatial', 'Left: spatial map of time-averaged coupling strength J per site. Heterogeneous patterns indicate the controller has learned spatially structured strategies rather than uniform rescaling. Right: distribution of final J values; markers indicate J_init (grey) and J_c = T_mean/2.269 (red).')}
+{_collapsible('7. Connectivity Analysis',
+    img('j_spatial', 'Left: spatial map of time-averaged coupling strength J per site. Heterogeneous patterns indicate the controller has learned spatially structured strategies rather than uniform rescaling. Right: distribution of final J values; markers indicate J_init (grey) and J_c = T_mean/2.269 (red).'))}
 
-<h2>8. Per-γ Analysis</h2>
+{_collapsible('8. Per-γ Analysis', f'''
 <div class="card">
   <p>Select a γ value to see its controller strategy heatmap and a short simulation animation.</p>
   {selector_html}
-</div>
+</div>''')}
 
-<h2>9. Configuration</h2>
-{config_html if config_html else '<p class="caption">[config.json not found — re-run exp2 to generate]</p>'}
+{_collapsible('9. Configuration', config_html if config_html else '<p class="caption">[config.json not found — re-run exp2 to generate]</p>')}
 
 </body>
 </html>"""

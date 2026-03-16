@@ -30,9 +30,11 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from report_utils import (  # noqa: E402
     REPORT_CSS,
     fig_to_b64,
-    canvas_chart_html,
+    fig_to_plotly_div,
+    plotly_training_curves,
     scenario_selector_html,
     PALETTE,
+    collapsible_section,
 )
 
 
@@ -370,6 +372,57 @@ def fig_net_J_per_cycle(data, config, run_label):
 
 
 # ---------------------------------------------------------------------------
+# Per-edge J overview (Plotly, toggle scatter / lines)
+# ---------------------------------------------------------------------------
+
+def fig_J_edges_overview(J_nk_cycles, run_label, n_subset=200):
+    """Plotly figure showing per-edge J evolution over cycles (line traces only).
+
+    Parameters
+    ----------
+    J_nk_cycles : ndarray, shape (n_cycles, n_bonds)
+    run_label : str
+    n_subset : int  Number of individual bond lines to draw.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+
+    n_cycles, n_bonds = J_nk_cycles.shape
+    cycles = list(range(n_cycles))
+
+    rng = np.random.default_rng(0)
+    subset_idx = rng.choice(n_bonds, size=min(n_subset, n_bonds), replace=False)
+
+    fig = go.Figure()
+    for bi in subset_idx:
+        fig.add_trace(go.Scatter(
+            x=cycles,
+            y=J_nk_cycles[:, bi].tolist(),
+            mode='lines',
+            line=dict(width=0.6, color='black'),
+            opacity=0.2,
+            showlegend=False,
+            hovertemplate=f'bond {bi}<br>cycle %{{x}}<br>J=%{{y:.3f}}<extra></extra>',
+        ))
+
+    fig.update_layout(
+        title=f'Per-Edge J over Cycles — {run_label}',
+        xaxis_title='Cycle',
+        yaxis_title='Coupling J',
+        height=400,
+        template='plotly_white',
+        margin=dict(l=60, r=20, t=80, b=40),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Summary table across all runs
 # ---------------------------------------------------------------------------
 
@@ -395,7 +448,6 @@ def summary_table_html(runs_summary):
             f'</tr>'
         )
     return f"""
-<h2>2. Summary Across All Runs</h2>
 <table>
   <thead>
     <tr>
@@ -498,8 +550,6 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
             W_net_early=W_net_early, W_net_late=W_net_late,
         ))
 
-    table_html = summary_table_html(runs_summary)
-
     # --- Interactive J_bar overview chart ---
     j_series = []
     for idx, (key, data) in enumerate(sorted(runs.items())):
@@ -516,11 +566,27 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
             'color': PALETTE[idx % len(PALETTE)],
         })
 
-    j_chart_html = canvas_chart_html(
-        j_series, 'exp1b_jbar',
-        title='Mean J̄ per Cycle — all runs (hover to inspect)',
-        xlabel='Cycle', ylabel='Mean J̄',
+    j_chart_html = fig_to_plotly_div(
+        plotly_training_curves(j_series, title='Mean J̄ per Cycle — all runs',
+                               xlabel='Cycle', ylabel='Mean J̄'),
+        include_plotlyjs='cdn')
+
+    # --- J_edges overview chart (§3b) ---
+    # Aggregate J_nk_cycles across runs for an overview (use all runs combined or first run)
+    j_edges_overview_html = '<p class="caption">[J_nk_cycles data not available — re-run exp1b_long_run.py to generate]</p>'
+    first_key_with_edges = next(
+        (k for k in sorted(runs) if 'J_nk_cycles' in runs[k]), None
     )
+    if first_key_with_edges is not None:
+        lam_e, alpha_e = first_key_with_edges
+        J_nk_cyc = runs[first_key_with_edges]['J_nk_cycles']
+        label_e = f'λ={lam_e:.2f} α={alpha_e:.2f}'
+        try:
+            edge_fig = fig_J_edges_overview(J_nk_cyc, f'All Runs — example: {label_e}')
+            if edge_fig is not None:
+                j_edges_overview_html = fig_to_plotly_div(edge_fig, include_plotlyjs=False)
+        except Exception as _e:
+            print(f'  [warn] J_edges_overview: {_e}', file=sys.stderr)
 
     # --- W_net overview chart ---
     wnet_series = []
@@ -538,12 +604,10 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
             'color': PALETTE[idx % len(PALETTE)],
         })
 
-    wnet_chart_html = canvas_chart_html(
-        wnet_series, 'exp1b_wnet',
-        title='W_net per Cycle — all runs (hover to inspect)',
-        xlabel='Cycle', ylabel='W_net',
-        baseline=0.0,
-    )
+    wnet_chart_html = fig_to_plotly_div(
+        plotly_training_curves(wnet_series, title='W_net per Cycle — all runs',
+                               xlabel='Cycle', ylabel='W_net', baseline=0.0),
+        include_plotlyjs=False)
 
     # --- Per-run scenario panels ---
     scenario_ids    = []
@@ -561,12 +625,33 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
         print(f'  Generating figures for {label}...')
         panel = f'<div class="run-panel">\n<h3>{label}</h3>\n'
 
-        for fig_fn, alt, caption in [
-            (lambda d=data, c=cfg, l=label: fig_J_drift(d, c, l),
-             'J drift', 'Mean J̄ over all steps coloured by phase (blue=cold, red=hot). '
-             'Horizontal lines mark J_c (critical coupling) and J_init. '
-             'Upward drift means the controller is systematically strengthening bonds.'),
+        # Per-edge J chart for this run (added after J drift)
+        run_j_edges_html = ''
+        if 'J_nk_cycles' in data:
+            try:
+                run_edge_fig = fig_J_edges_overview(data['J_nk_cycles'], label)
+                if run_edge_fig is not None:
+                    run_j_edges_html = fig_to_plotly_div(run_edge_fig, include_plotlyjs=False)
+            except Exception as _e:
+                print(f'    [warn] J_edges run {label}: {_e}', file=sys.stderr)
+        else:
+            run_j_edges_html = '<p class="caption">[Per-edge J data not available — re-run exp1b_long_run.py]</p>'
 
+        # J drift figure first, then inject per-edge chart
+        try:
+            f = fig_J_drift(data, cfg, label)
+            panel += _img(fig_to_b64(f), 'J drift',
+                          'Mean J̄ over all steps coloured by phase (blue=cold, red=hot). '
+                          'Horizontal lines mark J_c (critical coupling) and J_init. '
+                          'Upward drift means the controller is systematically strengthening bonds.') + '\n'
+        except Exception as e:
+            print(f'    [warn] J drift: {e}', file=sys.stderr)
+
+        # Per-edge J Plotly chart after J drift
+        if run_j_edges_html:
+            panel += f'<div class="card">{run_j_edges_html}</div>\n'
+
+        for fig_fn, alt, caption in [
             (lambda d=data, c=cfg, l=label: fig_budget_dynamics(d, c, l),
              'Budget dynamics', 'Top: mean budget per bond over time. '
              'Bottom: mean tanh(B/B_scale) — values near 1.0 indicate saturation '
@@ -621,25 +706,13 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
                 + '</div>\n'
             )
 
+    # --- Summary table (assembled here, placed at end) ---
+    table_html = summary_table_html(runs_summary)
+
     # --- Assemble HTML ---
     spc_display = configs[next(iter(configs))].get('steps_per_cycle', 200) if configs else 200
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Experiment 1b — Long-Run Diagnostics</title>
-  <style>{REPORT_CSS}</style>
-</head>
-<body>
-<h1>Experiment 1b: Long-Run Controller Diagnostics</h1>
-<p style="color:#555">
-  Generated by <code>experiments/exp1b_report.py</code> &mdash;
-  results from <code>{results_dir}</code><br>
-  Each controller run for {n_cycles} cycles × {spc_display} steps.
-</p>
 
-<h2>1. What This Report Shows</h2>
+    about_body = f"""
 <div class="card">
 <p>
 This report runs each exp1 controller for <strong>{n_cycles} temperature
@@ -670,28 +743,56 @@ The key diagnostic signatures to look for:
       of applied dJ &lt; 0, but if gating is trivial the fractions may be similar.</li>
   <li>W_net per cycle decreasing over time as J moves away from its optimal value.</li>
 </ul>
-</div>
+</div>"""
 
-{table_html}
-
-<h2>3. Overview: J̄ per Cycle (all runs)</h2>
-<div class="card">
+    j_overview_body = f"""
+<div class="card" style="width:100%;">
   <p>Per-cycle mean J̄ for all controllers. An upward trend confirms the drift hypothesis.</p>
   {j_chart_html}
 </div>
+<div class="card" style="width:100%;">
+  <p>Per-edge J evolution over cycles (first available run). Toggle between scatter and line views.</p>
+  {j_edges_overview_html}
+</div>"""
 
-<h2>4. Overview: W_net per Cycle (all runs)</h2>
+    wnet_body = f"""
 <div class="card">
   <p>Per-cycle W_net = Q_out − Q_in − W_remodel. A downward trend over cycles would
      indicate that J drift is degrading performance over time.</p>
   {wnet_chart_html}
-</div>
+</div>"""
 
-<h2>5. Per-Run Detailed Analysis</h2>
+    per_run_body = f"""
 <div class="card">
   <p>Select a run to see all diagnostic figures for that (λ, α) combination.</p>
   {selector_html}
-</div>
+</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Experiment 1b — Long-Run Diagnostics</title>
+  <style>{REPORT_CSS}</style>
+</head>
+<body>
+<h1>Experiment 1b: Long-Run Controller Diagnostics</h1>
+<p style="color:#555">
+  Generated by <code>experiments/exp1b_report.py</code> &mdash;
+  results from <code>{results_dir}</code><br>
+  Each controller run for {n_cycles} cycles × {spc_display} steps.
+</p>
+
+{collapsible_section('1. What This Report Shows', about_body, open=False)}
+
+{collapsible_section('2. Overview: J̄ and Per-Edge J per Cycle', j_overview_body)}
+
+{collapsible_section('3. Overview: W_net per Cycle', wnet_body)}
+
+{collapsible_section('4. Per-Run Detailed Analysis', per_run_body)}
+
+{collapsible_section('5. Summary Across All Runs', table_html)}
 
 </body>
 </html>

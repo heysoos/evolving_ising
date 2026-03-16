@@ -235,7 +235,7 @@ def run_long_sim(run_dir, n_cycles=500, seed=0):
         )
         return (spins_c, key_c, J_c, bud_c, mag_c, E_post), out
 
-    # --- JIT-compiled simulation ---
+    # --- JIT-compiled simulation (nested scan: outer=cycles, inner=steps) ---
     @jax.jit
     def _run_sim(spins, key):
         E_init = jnp.mean(model.energy(J_init_jax, spins))
@@ -245,9 +245,22 @@ def run_long_sim(run_dir, n_cycles=500, seed=0):
             jnp.zeros(N, dtype=jnp.float32),         # mag_ema
             E_init,
         )
-        t_arr = jnp.arange(total_steps, dtype=jnp.float32)
-        _, outputs = jax.lax.scan(_step_fn, init_carry, t_arr)
-        return outputs
+
+        def _cycle_body(carry, cycle_idx):
+            t_start = jnp.float32(cycle_idx * steps_per_cycle)
+            t_arr_c = jnp.arange(steps_per_cycle, dtype=jnp.float32) + t_start
+            step_carry, step_outs = jax.lax.scan(_step_fn, carry, t_arr_c)
+            # Per-cycle J snapshot for all valid bonds
+            J_nk_snap = step_carry[2][valid_i_jax, valid_k_jax]   # (n_bonds,)
+            return step_carry, (step_outs, J_nk_snap)
+
+        _, (nested_step_outs, J_nk_cycles) = jax.lax.scan(
+            _cycle_body, init_carry, jnp.arange(n_cycles, dtype=jnp.int32)
+        )
+        # nested_step_outs: each element shape (n_cycles, steps_per_cycle)
+        # Flatten to (total_steps,):
+        outputs = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), nested_step_outs)
+        return outputs, J_nk_cycles
 
     # --- Initialise and warmup ---
     key = jax.random.PRNGKey(seed)
@@ -258,7 +271,7 @@ def run_long_sim(run_dir, n_cycles=500, seed=0):
     )
 
     print(f'  Running {n_cycles} cycles ({total_steps} steps)...', end=' ', flush=True)
-    outputs = _run_sim(spins, rk)
+    outputs, J_nk_cycles = _run_sim(spins, rk)
     print('done.')
 
     keys_out = [
@@ -267,7 +280,10 @@ def run_long_sim(run_dir, n_cycles=500, seed=0):
         'dJ_mean', 'dJ_applied_mean',
         'Q_in_step', 'Q_out_step', 'W_remodel_step',
     ]
-    return {k: np.asarray(v) for k, v in zip(keys_out, outputs)} | {'config': config}
+    result = {k: np.asarray(v) for k, v in zip(keys_out, outputs)}
+    result['J_nk_cycles'] = np.asarray(J_nk_cycles)  # shape (n_cycles, n_bonds)
+    result['config'] = config
+    return result
 
 
 # ---------------------------------------------------------------------------

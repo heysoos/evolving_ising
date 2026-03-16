@@ -7,7 +7,6 @@ GIF generation, and an interactive canvas-based training curve chart.
 
 import io
 import base64
-import json
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -75,7 +74,27 @@ code { background: #edf2f7; padding: 2px 6px; border-radius: 3px;
 .beat-no  { color: #c53030; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5em; margin: 1em 0; }
 @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
+details { margin: 1.5em 0; }
+details > summary {
+    color: #2c5282; font-size: 1.25em; font-weight: 600;
+    border-left: 4px solid #3182ce; padding: .4em .6em;
+    cursor: pointer; list-style: none;
+    display: flex; align-items: center; gap: .5em;
+}
+details > summary::before { content: '▶'; font-size: .75em; transition: transform .15s; }
+details[open] > summary::before { transform: rotate(90deg); }
+details > summary::-webkit-details-marker { display: none; }
 """
+
+
+# ---------------------------------------------------------------------------
+# Collapsible section helper
+# ---------------------------------------------------------------------------
+
+def collapsible_section(title, content_html, open=True):
+    """Wrap content in a collapsible <details> block with an <h2>-styled summary."""
+    open_attr = ' open' if open else ''
+    return f'<details{open_attr}>\n<summary>{title}</summary>\n{content_html}\n</details>\n'
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +575,7 @@ def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5
 
 
 # ---------------------------------------------------------------------------
-# Interactive canvas chart (pure JS — no external dependencies)
+# Colour palette for multi-series charts
 # ---------------------------------------------------------------------------
 
 # 12-color palette for multi-series charts
@@ -566,163 +585,13 @@ PALETTE = [
     '#aec7e8', '#ffbb78',
 ]
 
-_CANVAS_CHART_JS = r"""
-(function() {
-  const cid = '{CID}';
-  const canvas = document.getElementById(cid);
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const P = {t:32, r:20, b:44, l:58};
-  const series = {SERIES};
-  const baseline = {BASELINE};
-  const title = '{TITLE}';
-  const xlabel = '{XLABEL}';
-  const ylabel = '{YLABEL}';
-  let hidden = {}, hoverMx = null;
-
-  const allX = series.flatMap(s=>s.x);
-  const allY = series.flatMap(s=>s.y);
-  const xMin=Math.min(...allX), xMax=Math.max(...allX);
-  const rawYMin=Math.min(...allY, baseline!==null?baseline:Infinity);
-  const rawYMax=Math.max(...allY, baseline!==null?baseline:-Infinity);
-  const yPad=(rawYMax-rawYMin)*0.05||1;
-  const yMin=rawYMin-yPad, yMax=rawYMax+yPad;
-
-  function tx(x){ return P.l+(x-xMin)/(xMax-xMin||1)*(W-P.l-P.r); }
-  function ty(y){ return H-P.b-(y-yMin)/(yMax-yMin||1)*(H-P.t-P.b); }
-  function fromMx(mx){ return xMin+(mx-P.l)/(W-P.l-P.r)*(xMax-xMin); }
-
-  function draw(){
-    ctx.clearRect(0,0,W,H);
-    // grid
-    ctx.strokeStyle='#e4e8ee'; ctx.lineWidth=0.7;
-    for(let i=0;i<=5;i++){
-      const y=yMin+(yMax-yMin)*i/5;
-      const cy=ty(y);
-      ctx.beginPath(); ctx.moveTo(P.l,cy); ctx.lineTo(W-P.r,cy); ctx.stroke();
-      ctx.fillStyle='#555'; ctx.font='10px sans-serif'; ctx.textAlign='right';
-      ctx.fillText(y.toFixed(1),P.l-5,cy+3.5);
-    }
-    // x ticks
-    const nxt=Math.ceil(xMax/5/50)*50||100;
-    ctx.fillStyle='#555'; ctx.textAlign='center';
-    for(let x=0;x<=xMax;x+=nxt){
-      ctx.fillText(x,tx(x),H-P.b+13);
-    }
-    // axis labels
-    ctx.fillStyle='#333'; ctx.font='11px sans-serif'; ctx.textAlign='center';
-    ctx.fillText(xlabel, (P.l+W-P.r)/2, H-2);
-    ctx.save(); ctx.translate(11,(P.t+H-P.b)/2); ctx.rotate(-Math.PI/2);
-    ctx.fillText(ylabel,0,0); ctx.restore();
-    // title
-    ctx.font='bold 12px sans-serif';
-    ctx.fillText(title,(P.l+W-P.r)/2,16);
-    // baseline
-    if(baseline!==null){
-      const by=ty(baseline);
-      ctx.strokeStyle='#c0392b'; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
-      ctx.beginPath(); ctx.moveTo(P.l,by); ctx.lineTo(W-P.r,by); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle='#c0392b'; ctx.font='10px sans-serif'; ctx.textAlign='right';
-      ctx.fillText('baseline',W-P.r-2,by-4);
-    }
-    // series
-    series.forEach((s,idx)=>{
-      if(hidden[idx]) return;
-      ctx.strokeStyle=s.color; ctx.lineWidth=1.5; ctx.setLineDash([]);
-      ctx.beginPath();
-      s.x.forEach((xi,i)=>{ i===0?ctx.moveTo(tx(xi),ty(s.y[i])):ctx.lineTo(tx(xi),ty(s.y[i])); });
-      ctx.stroke();
-    });
-    // hover
-    if(hoverMx!==null){
-      const hx=hoverMx;
-      if(hx>=P.l&&hx<=W-P.r){
-        ctx.strokeStyle='rgba(0,0,0,0.18)'; ctx.lineWidth=1; ctx.setLineDash([]);
-        ctx.beginPath(); ctx.moveTo(hx,P.t); ctx.lineTo(hx,H-P.b); ctx.stroke();
-        const wx=fromMx(hx);
-        const lines=[];
-        series.forEach((s,idx)=>{
-          if(hidden[idx]) return;
-          let best=null, bd=Infinity;
-          s.x.forEach((xi,i)=>{ const d=Math.abs(xi-wx); if(d<bd){bd=d;best=i;} });
-          if(best!==null) lines.push({label:s.label,val:s.y[best],color:s.color,gen:s.x[best]});
-        });
-        if(lines.length){
-          const bw=150, bh=lines.length*15+20;
-          let bx=hx+8, by=P.t+4;
-          if(bx+bw>W-P.r) bx=hx-bw-8;
-          ctx.fillStyle='rgba(255,255,255,0.94)'; ctx.strokeStyle='#bbb'; ctx.lineWidth=1;
-          ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,4); ctx.fill(); ctx.stroke();
-          ctx.font='10px monospace'; ctx.textAlign='left';
-          ctx.fillStyle='#333';
-          ctx.fillText('gen '+Math.round(lines[0].gen),bx+6,by+13);
-          lines.forEach((l,i)=>{
-            ctx.fillStyle=l.color;
-            ctx.fillText(l.label+': '+l.val.toFixed(2),bx+6,by+14+14*(i+1));
-          });
-        }
-      }
-    }
-  }
-
-  canvas.addEventListener('mousemove',e=>{
-    const r=canvas.getBoundingClientRect();
-    hoverMx=e.clientX-r.left; draw();
-  });
-  canvas.addEventListener('mouseleave',()=>{ hoverMx=null; draw(); });
-
-  // legend buttons
-  const leg=document.getElementById(cid+'_legend');
-  if(leg){ series.forEach((s,idx)=>{
-    const b=document.createElement('button');
-    b.style.cssText='background:'+s.color+';border:none;border-radius:3px;color:#fff;'+
-      'padding:3px 9px;margin:2px 3px;font-size:11px;cursor:pointer;';
-    b.textContent=s.label;
-    b.title='Click to toggle';
-    b.onclick=()=>{ hidden[idx]=!hidden[idx]; b.style.opacity=hidden[idx]?'0.35':'1'; draw(); };
-    leg.appendChild(b);
-  }); }
-
-  draw();
-})();
-"""
-
-
-def canvas_chart_html(series_data, canvas_id, title='', xlabel='Generation', ylabel='W_net',
-                      width=720, height=290, baseline=None):
-    """Return a self-contained HTML+JS canvas chart.
-
-    Parameters
-    ----------
-    series_data : list of dicts with keys 'label', 'x' (list), 'y' (list), 'color' (str)
-    canvas_id : str  — unique HTML id for the canvas element
-    baseline : float or None — horizontal reference line
-    """
-    series_json = json.dumps(series_data)
-    baseline_js = 'null' if baseline is None else str(float(baseline))
-    js = (_CANVAS_CHART_JS
-          .replace('{CID}', canvas_id)
-          .replace('{SERIES}', series_json)
-          .replace('{BASELINE}', baseline_js)
-          .replace('{TITLE}', title.replace("'", "\\'"))
-          .replace('{XLABEL}', xlabel.replace("'", "\\'"))
-          .replace('{YLABEL}', ylabel.replace("'", "\\'")))
-    return (
-        f'<canvas id="{canvas_id}" width="{width}" height="{height}" '
-        f'style="max-width:100%;border:1px solid #d0d9e8;border-radius:6px;'
-        f'box-shadow:0 2px 8px rgba(0,0,0,.07);"></canvas>\n'
-        f'<div id="{canvas_id}_legend" style="margin:.4em 0 1em;"></div>\n'
-        f'<script>{js}</script>\n'
-    )
-
 
 # ---------------------------------------------------------------------------
 # Scenario selector widget
 # ---------------------------------------------------------------------------
 
 def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run'):
+    # kept for backward compatibility — use plotly_training_curves + fig_to_plotly_div for new reports
     """Return a dropdown widget that shows/hides scenario panel divs.
 
     The content divs must be written separately by the caller, with
@@ -740,8 +609,292 @@ def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run')
         f'<div class="scenario-bar">\n'
         f'  <label for="sc_sel_{scenario_ids[0]}">{title}:</label>\n'
         f'  <select id="sc_sel_{scenario_ids[0]}" '
-        f'onchange="{hide_all};document.getElementById(this.value).style.display=\'block\'">\n'
+        f'onchange="{hide_all};document.getElementById(this.value).style.display=\'block\';window.dispatchEvent(new Event(\'resize\'))">\n'
         f'{options}\n'
         f'  </select>\n'
         f'</div>\n'
     )
+
+
+# ---------------------------------------------------------------------------
+# Plotly helpers
+# ---------------------------------------------------------------------------
+
+try:
+    import plotly.graph_objects as _go
+    HAS_PLOTLY = True
+except ImportError:
+    _go = None
+    HAS_PLOTLY = False
+
+
+def fig_to_plotly_div(fig, include_plotlyjs='cdn'):
+    """Convert a Plotly Figure to an HTML div string for embedding.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+    include_plotlyjs : str or bool
+        'cdn'  — adds a CDN <script> tag (~10 KB stub)
+        True   — embeds full plotly.js (~3 MB, fully offline)
+        False  — omit (assume plotly.js already included earlier on the page)
+    """
+    if not HAS_PLOTLY or fig is None:
+        return ''
+    return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs,
+                       config={'responsive': True})
+
+
+def plotly_training_curves(series_data, baseline=None, title='',
+                           xlabel='Generation', ylabel='W_net', log_x=False):
+    """Build a Plotly training-curve figure.
+
+    Parameters
+    ----------
+    series_data : list of dicts
+        Each dict has keys 'label', 'x', 'y', and optionally 'color'.
+    baseline : float or None
+        Horizontal reference line.
+    log_x : bool
+        If True, use a log scale on the x-axis.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or not series_data:
+        return None
+    fig = _go.Figure()
+    for s in series_data:
+        kw = dict(
+            name=s['label'], x=s['x'], y=s['y'], mode='lines',
+            hovertemplate='gen %{x}<br>' + s['label'] + ': %{y:.3f}<extra></extra>',
+        )
+        if 'color' in s:
+            kw['line'] = dict(color=s['color'])
+        fig.add_trace(_go.Scatter(**kw))
+    if baseline is not None:
+        fig.add_hline(
+            y=baseline, line_dash='dash', line_color='crimson',
+            annotation_text=f'baseline {baseline:.3f}',
+            annotation_position='bottom right',
+        )
+    layout_kw = dict(
+        title=title, xaxis_title=xlabel, yaxis_title=ylabel,
+        legend=dict(
+            orientation='v',
+            yanchor='top', y=1,
+            xanchor='left', x=1.02,
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#cbd5e0', borderwidth=1,
+        ),
+        margin=dict(l=60, r=160, t=80, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    if len(series_data) > 1:
+        layout_kw['updatemenus'] = [{
+            'type': 'buttons', 'direction': 'left',
+            'x': 1.02, 'y': 1.08, 'xanchor': 'left', 'yanchor': 'bottom',
+            'buttons': [
+                {'label': 'All On',  'method': 'restyle', 'args': [{'visible': True}]},
+                {'label': 'All Off', 'method': 'restyle', 'args': [{'visible': 'legendonly'}]},
+            ],
+            'bgcolor': '#edf2f7', 'bordercolor': '#cbd5e0', 'font': {'size': 11},
+        }]
+    fig.update_layout(**layout_kw)
+    if log_x:
+        fig.update_xaxes(type='log')
+    else:
+        fig.update_xaxes(rangemode='tozero')
+    return fig
+
+
+def plotly_heatmap(grid_data, x_labels, y_labels, title='',
+                   x_title='', y_title='', colorscale='RdYlGn'):
+    """Build a Plotly heatmap with hover labels.
+
+    Parameters
+    ----------
+    grid_data : 2D array (rows = y_labels, cols = x_labels)
+    x_labels, y_labels : list of str
+    colorscale : str   Plotly colorscale name
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or grid_data is None:
+        return None
+    arr = np.array(grid_data, dtype=float)
+    text = [[f'{arr[r, c]:.3f}' if not np.isnan(arr[r, c]) else 'N/A'
+             for c in range(arr.shape[1])]
+            for r in range(arr.shape[0])]
+    fig = _go.Figure(_go.Heatmap(
+        z=arr.tolist(),
+        x=[str(xl) for xl in x_labels],
+        y=[str(yl) for yl in y_labels],
+        colorscale=colorscale,
+        text=text, texttemplate='%{text}',
+        hovertemplate='x=%{x}<br>y=%{y}<br>value=%{z:.3f}<extra></extra>',
+        showscale=True,
+    ))
+    fig.update_layout(
+        title=title, xaxis_title=x_title, yaxis_title=y_title,
+        margin=dict(l=60, r=20, t=60, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    return fig
+
+
+def plotly_sigma(series_data, title='CMA-ES σ Convergence'):
+    """Build a Plotly sigma-convergence figure (log y-axis).
+
+    Parameters
+    ----------
+    series_data : list of dicts with 'label', 'x', 'y', optional 'color'
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or not series_data:
+        return None
+    fig = _go.Figure()
+    for s in series_data:
+        kw = dict(
+            name=s['label'], x=s['x'], y=s['y'], mode='lines',
+            hovertemplate='gen %{x}<br>σ=%{y:.4f}<extra></extra>',
+        )
+        if 'color' in s:
+            kw['line'] = dict(color=s['color'])
+        fig.add_trace(_go.Scatter(**kw))
+    fig.update_layout(
+        title=title, xaxis_title='Generation', yaxis_title='σ (log scale)',
+        yaxis_type='log',
+        legend=dict(
+            orientation='v',
+            yanchor='top', y=1,
+            xanchor='left', x=1.02,
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#cbd5e0', borderwidth=1,
+        ),
+        margin=dict(l=60, r=160, t=80, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    return fig
+
+
+def _write_run_training_report(run_dir, log):
+    """Write a per-run training_report.html with Plotly curves.
+
+    Parameters
+    ----------
+    run_dir : str or Path
+    log : dict with keys 'generation', 'best_fitness', 'mean_fitness', 'sigma'
+    """
+    if not HAS_PLOTLY:
+        return
+    import datetime
+    from pathlib import Path as _Path
+    run_dir = _Path(run_dir)
+    name = run_dir.name
+
+    gens = [int(g) for g in log.get('generation', [])]
+    best = [float(v) for v in log.get('best_fitness', [])]
+    mean = [float(v) for v in log.get('mean_fitness', [])]
+    sigma_vals = [float(v) for v in log.get('sigma', [])]
+
+    series_wnet = [
+        {'label': 'Best W_net', 'x': gens, 'y': best, 'color': '#1f77b4'},
+        {'label': 'Mean W_net', 'x': gens, 'y': mean, 'color': '#ff7f0e'},
+    ]
+    series_sigma = [{'label': 'σ', 'x': gens, 'y': sigma_vals, 'color': '#2ca02c'}]
+
+    fig_curves = plotly_training_curves(series_wnet, title=f'Training — {name}',
+                                        xlabel='Generation', ylabel='W_net')
+    fig_sig = plotly_sigma(series_sigma, title=f'σ Convergence — {name}')
+
+    n_gens = len(gens)
+    best_so_far = max(best) if best else float('nan')
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Training Report — {name}</title>
+  <style>{REPORT_CSS}</style>
+</head>
+<body>
+<h1>Training Report — {name}</h1>
+<p class="meta">Generated: {ts} · Generations completed: {n_gens} · Best W_net: {best_so_far:.4f}</p>
+<h2>Training Curves</h2>
+<div class="card">{fig_to_plotly_div(fig_curves, include_plotlyjs='cdn')}</div>
+<h2>σ Convergence</h2>
+<div class="card">{fig_to_plotly_div(fig_sig, include_plotlyjs=False)}</div>
+</body>
+</html>"""
+
+    (run_dir / 'training_report.html').write_text(html, encoding='utf-8')
+
+
+def generate_training_report(sweep_dir, output_path=None, title=''):
+    """Scan sweep_dir for subdirs with training_log.npz; write training_report.html.
+
+    Parameters
+    ----------
+    sweep_dir : str or Path
+    output_path : str or Path or None
+        Defaults to sweep_dir/training_report.html.
+    title : str
+    """
+    if not HAS_PLOTLY:
+        return
+    import datetime
+    from pathlib import Path as _Path
+    sweep_dir = _Path(sweep_dir)
+    if not sweep_dir.is_dir():
+        return
+
+    series_data = []
+    for sub in sorted(sweep_dir.iterdir()):
+        if not sub.is_dir():
+            continue
+        lp = sub / 'training_log.npz'
+        if not lp.exists():
+            continue
+        try:
+            d = np.load(lp)
+            gens = list(d['generation'].astype(int))
+            best = list(d['best_fitness'].astype(float))
+            color = PALETTE[len(series_data) % len(PALETTE)]
+            series_data.append({'label': sub.name, 'x': gens, 'y': best, 'color': color})
+        except Exception:
+            continue
+
+    if not series_data:
+        return
+
+    report_title = title or f'Training Progress — {sweep_dir.name}'
+    fig = plotly_training_curves(series_data, title=report_title,
+                                 xlabel='Generation', ylabel='Best W_net')
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{report_title}</title>
+  <style>{REPORT_CSS}</style>
+</head>
+<body>
+<h1>{report_title}</h1>
+<p class="meta">Generated: {ts} · Runs: {len(series_data)}</p>
+<div class="card">{fig_to_plotly_div(fig, include_plotlyjs='cdn')}</div>
+</body>
+</html>"""
+
+    out = _Path(output_path) if output_path else sweep_dir / 'training_report.html'
+    out.write_text(html, encoding='utf-8')
