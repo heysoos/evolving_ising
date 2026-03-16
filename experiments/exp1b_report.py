@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from report_utils import (  # noqa: E402
     REPORT_CSS,
     fig_to_b64,
-    canvas_chart_html,
+    fig_to_plotly_div,
+    plotly_training_curves,
     scenario_selector_html,
     PALETTE,
 )
@@ -516,11 +517,10 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
             'color': PALETTE[idx % len(PALETTE)],
         })
 
-    j_chart_html = canvas_chart_html(
-        j_series, 'exp1b_jbar',
-        title='Mean J̄ per Cycle — all runs (hover to inspect)',
-        xlabel='Cycle', ylabel='Mean J̄',
-    )
+    j_chart_html = fig_to_plotly_div(
+        plotly_training_curves(j_series, title='Mean J̄ per Cycle — all runs',
+                               xlabel='Cycle', ylabel='Mean J̄'),
+        include_plotlyjs='cdn')
 
     # --- W_net overview chart ---
     wnet_series = []
@@ -538,12 +538,10 @@ def generate_report(results_dir, exp1_dir=None, n_cycles=500):
             'color': PALETTE[idx % len(PALETTE)],
         })
 
-    wnet_chart_html = canvas_chart_html(
-        wnet_series, 'exp1b_wnet',
-        title='W_net per Cycle — all runs (hover to inspect)',
-        xlabel='Cycle', ylabel='W_net',
-        baseline=0.0,
-    )
+    wnet_chart_html = fig_to_plotly_div(
+        plotly_training_curves(wnet_series, title='W_net per Cycle — all runs',
+                               xlabel='Cycle', ylabel='W_net', baseline=0.0),
+        include_plotlyjs=False)
 
     # --- Per-run scenario panels ---
     scenario_ids    = []

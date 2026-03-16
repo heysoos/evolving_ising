@@ -116,39 +116,6 @@ def fig_heatmap(results):
     return fig_to_plotly_div(fig, include_plotlyjs='cdn') if fig is not None else ''
 
 
-def fig_slices(results):
-    W = results['W_net_grid']
-    J0 = results['J0_values']
-    tau = results['tau_values']
-    T_mean = 2.5
-    J_c = T_mean / 2.269
-
-    best_idx = np.unravel_index(W.argmax(), W.shape)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    ax = axes[0]
-    ax.plot(J0, W[:, best_idx[1]], 'o-', color='steelblue', lw=1.8, ms=4)
-    ax.axvline(J_c, color='tomato', ls='--', lw=1.5, label=f'J_c = {J_c:.2f}')
-    ax.axvline(results['J0_opt'], color='seagreen', ls=':', lw=1.8,
-               label=f"J0_opt = {results['J0_opt']:.2f}")
-    ax.set_xlabel('J₀')
-    ax.set_ylabel('W_net')
-    ax.set_title(f'W_net vs J₀  (τ = {results["tau_opt"]})')
-    ax.legend(fontsize=8)
-
-    ax = axes[1]
-    ax.semilogx(tau, W[best_idx[0], :], 's-', color='darkorange', lw=1.8, ms=5)
-    ax.set_xlabel('τ')
-    ax.set_ylabel('W_net')
-    ax.set_title(f'W_net vs τ  (J₀ = {results["J0_opt"]:.2f})')
-    ax.axvline(results['tau_opt'], color='tomato', ls='--', lw=1.5,
-               label=f'τ_opt = {int(results["tau_opt"])}')
-    ax.legend(fontsize=8)
-
-    fig.tight_layout()
-    return _fig_to_b64(fig)
-
 
 def fig_scatter(results):
     W = results['W_net_grid'].ravel()

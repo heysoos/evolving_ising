@@ -7,7 +7,6 @@ GIF generation, and an interactive canvas-based training curve chart.
 
 import io
 import base64
-import json
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -556,7 +555,7 @@ def frames_to_gif_b64(spin_frames, J_mean_frames, fps=8, max_frames=200, scale=5
 
 
 # ---------------------------------------------------------------------------
-# Interactive canvas chart (pure JS — no external dependencies)
+# Colour palette for multi-series charts
 # ---------------------------------------------------------------------------
 
 # 12-color palette for multi-series charts
@@ -565,157 +564,6 @@ PALETTE = [
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
     '#aec7e8', '#ffbb78',
 ]
-
-_CANVAS_CHART_JS = r"""
-(function() {
-  const cid = '{CID}';
-  const canvas = document.getElementById(cid);
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const P = {t:32, r:20, b:44, l:58};
-  const series = {SERIES};
-  const baseline = {BASELINE};
-  const title = '{TITLE}';
-  const xlabel = '{XLABEL}';
-  const ylabel = '{YLABEL}';
-  let hidden = {}, hoverMx = null;
-
-  const allX = series.flatMap(s=>s.x);
-  const allY = series.flatMap(s=>s.y);
-  const xMin=Math.min(...allX), xMax=Math.max(...allX);
-  const rawYMin=Math.min(...allY, baseline!==null?baseline:Infinity);
-  const rawYMax=Math.max(...allY, baseline!==null?baseline:-Infinity);
-  const yPad=(rawYMax-rawYMin)*0.05||1;
-  const yMin=rawYMin-yPad, yMax=rawYMax+yPad;
-
-  function tx(x){ return P.l+(x-xMin)/(xMax-xMin||1)*(W-P.l-P.r); }
-  function ty(y){ return H-P.b-(y-yMin)/(yMax-yMin||1)*(H-P.t-P.b); }
-  function fromMx(mx){ return xMin+(mx-P.l)/(W-P.l-P.r)*(xMax-xMin); }
-
-  function draw(){
-    ctx.clearRect(0,0,W,H);
-    // grid
-    ctx.strokeStyle='#e4e8ee'; ctx.lineWidth=0.7;
-    for(let i=0;i<=5;i++){
-      const y=yMin+(yMax-yMin)*i/5;
-      const cy=ty(y);
-      ctx.beginPath(); ctx.moveTo(P.l,cy); ctx.lineTo(W-P.r,cy); ctx.stroke();
-      ctx.fillStyle='#555'; ctx.font='10px sans-serif'; ctx.textAlign='right';
-      ctx.fillText(y.toFixed(1),P.l-5,cy+3.5);
-    }
-    // x ticks
-    const nxt=Math.ceil(xMax/5/50)*50||100;
-    ctx.fillStyle='#555'; ctx.textAlign='center';
-    for(let x=0;x<=xMax;x+=nxt){
-      ctx.fillText(x,tx(x),H-P.b+13);
-    }
-    // axis labels
-    ctx.fillStyle='#333'; ctx.font='11px sans-serif'; ctx.textAlign='center';
-    ctx.fillText(xlabel, (P.l+W-P.r)/2, H-2);
-    ctx.save(); ctx.translate(11,(P.t+H-P.b)/2); ctx.rotate(-Math.PI/2);
-    ctx.fillText(ylabel,0,0); ctx.restore();
-    // title
-    ctx.font='bold 12px sans-serif';
-    ctx.fillText(title,(P.l+W-P.r)/2,16);
-    // baseline
-    if(baseline!==null){
-      const by=ty(baseline);
-      ctx.strokeStyle='#c0392b'; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
-      ctx.beginPath(); ctx.moveTo(P.l,by); ctx.lineTo(W-P.r,by); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle='#c0392b'; ctx.font='10px sans-serif'; ctx.textAlign='right';
-      ctx.fillText('baseline',W-P.r-2,by-4);
-    }
-    // series
-    series.forEach((s,idx)=>{
-      if(hidden[idx]) return;
-      ctx.strokeStyle=s.color; ctx.lineWidth=1.5; ctx.setLineDash([]);
-      ctx.beginPath();
-      s.x.forEach((xi,i)=>{ i===0?ctx.moveTo(tx(xi),ty(s.y[i])):ctx.lineTo(tx(xi),ty(s.y[i])); });
-      ctx.stroke();
-    });
-    // hover
-    if(hoverMx!==null){
-      const hx=hoverMx;
-      if(hx>=P.l&&hx<=W-P.r){
-        ctx.strokeStyle='rgba(0,0,0,0.18)'; ctx.lineWidth=1; ctx.setLineDash([]);
-        ctx.beginPath(); ctx.moveTo(hx,P.t); ctx.lineTo(hx,H-P.b); ctx.stroke();
-        const wx=fromMx(hx);
-        const lines=[];
-        series.forEach((s,idx)=>{
-          if(hidden[idx]) return;
-          let best=null, bd=Infinity;
-          s.x.forEach((xi,i)=>{ const d=Math.abs(xi-wx); if(d<bd){bd=d;best=i;} });
-          if(best!==null) lines.push({label:s.label,val:s.y[best],color:s.color,gen:s.x[best]});
-        });
-        if(lines.length){
-          const bw=150, bh=lines.length*15+20;
-          let bx=hx+8, by=P.t+4;
-          if(bx+bw>W-P.r) bx=hx-bw-8;
-          ctx.fillStyle='rgba(255,255,255,0.94)'; ctx.strokeStyle='#bbb'; ctx.lineWidth=1;
-          ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,4); ctx.fill(); ctx.stroke();
-          ctx.font='10px monospace'; ctx.textAlign='left';
-          ctx.fillStyle='#333';
-          ctx.fillText('gen '+Math.round(lines[0].gen),bx+6,by+13);
-          lines.forEach((l,i)=>{
-            ctx.fillStyle=l.color;
-            ctx.fillText(l.label+': '+l.val.toFixed(2),bx+6,by+14+14*(i+1));
-          });
-        }
-      }
-    }
-  }
-
-  canvas.addEventListener('mousemove',e=>{
-    const r=canvas.getBoundingClientRect();
-    hoverMx=e.clientX-r.left; draw();
-  });
-  canvas.addEventListener('mouseleave',()=>{ hoverMx=null; draw(); });
-
-  // legend buttons
-  const leg=document.getElementById(cid+'_legend');
-  if(leg){ series.forEach((s,idx)=>{
-    const b=document.createElement('button');
-    b.style.cssText='background:'+s.color+';border:none;border-radius:3px;color:#fff;'+
-      'padding:3px 9px;margin:2px 3px;font-size:11px;cursor:pointer;';
-    b.textContent=s.label;
-    b.title='Click to toggle';
-    b.onclick=()=>{ hidden[idx]=!hidden[idx]; b.style.opacity=hidden[idx]?'0.35':'1'; draw(); };
-    leg.appendChild(b);
-  }); }
-
-  draw();
-})();
-"""
-
-
-def canvas_chart_html(series_data, canvas_id, title='', xlabel='Generation', ylabel='W_net',
-                      width=720, height=290, baseline=None):
-    """Return a self-contained HTML+JS canvas chart.
-
-    Parameters
-    ----------
-    series_data : list of dicts with keys 'label', 'x' (list), 'y' (list), 'color' (str)
-    canvas_id : str  — unique HTML id for the canvas element
-    baseline : float or None — horizontal reference line
-    """
-    series_json = json.dumps(series_data)
-    baseline_js = 'null' if baseline is None else str(float(baseline))
-    js = (_CANVAS_CHART_JS
-          .replace('{CID}', canvas_id)
-          .replace('{SERIES}', series_json)
-          .replace('{BASELINE}', baseline_js)
-          .replace('{TITLE}', title.replace("'", "\\'"))
-          .replace('{XLABEL}', xlabel.replace("'", "\\'"))
-          .replace('{YLABEL}', ylabel.replace("'", "\\'")))
-    return (
-        f'<canvas id="{canvas_id}" width="{width}" height="{height}" '
-        f'style="max-width:100%;border:1px solid #d0d9e8;border-radius:6px;'
-        f'box-shadow:0 2px 8px rgba(0,0,0,.07);"></canvas>\n'
-        f'<div id="{canvas_id}_legend" style="margin:.4em 0 1em;"></div>\n'
-        f'<script>{js}</script>\n'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +633,6 @@ def plotly_training_curves(series_data, baseline=None, title='',
     ----------
     series_data : list of dicts
         Each dict has keys 'label', 'x', 'y', and optionally 'color'.
-        Same format accepted by canvas_chart_html.
     baseline : float or None
         Horizontal reference line.
 
