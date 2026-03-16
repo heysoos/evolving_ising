@@ -36,10 +36,10 @@ from report_utils import (  # noqa: E402
     fig_to_plotly_div,
     plotly_training_curves,
     plotly_sigma,
+    collapsible_section as _collapsible,
 )
 
 _EXPLANATION = """
-<h2>1. About This Experiment</h2>
 <div class="card">
   <h3>Physical Setup</h3>
   <p>Same oscillating bath as Experiments 0 and 1:
@@ -119,7 +119,7 @@ def fig_gamma_sweep(gamma_values, best_per_gamma, best_gamma, baseline_W=11.86):
     fig.update_layout(
         title='W_net vs Neighbourhood Pooling Strength γ',
         xaxis_title='γ', yaxis_title='Best W_net (final)',
-        margin=dict(l=60, r=20, t=60, b=40), height=350, template='plotly_white',
+        margin=dict(l=60, r=20, t=80, b=40), height=350, template='plotly_white',
     )
     return fig_to_plotly_div(fig, include_plotlyjs=False)
 
@@ -142,7 +142,7 @@ def fig_tau_sweep(tau_values, best_per_tau, best_gamma, baseline_W=11.86):
     fig.update_layout(
         title=f'W_net vs τ  (γ = {best_gamma:.2f})',
         xaxis_title='τ (cycle period)', yaxis_title='Best W_net (final)',
-        margin=dict(l=60, r=20, t=60, b=40), height=350, template='plotly_white',
+        margin=dict(l=60, r=20, t=80, b=40), height=350, template='plotly_white',
     )
     return fig_to_plotly_div(fig, include_plotlyjs=False)
 
@@ -489,9 +489,9 @@ def generate_report(results_dir='results/exp2', out=None,
 <h1>Experiment 2 — Neighbourhood Budget</h1>
 <p class="meta">Generated: {ts} · Results: {os.path.abspath(results_dir)}</p>
 
-{_EXPLANATION}
+{_collapsible('1. About This Experiment', _EXPLANATION, open=False)}
 
-<h2>2. Key Results</h2>
+{_collapsible('2. Key Results', f'''
 <div class="card">
   <div class="highlight">
     <strong>Best γ:</strong> {best_gamma:.2f} →
@@ -502,39 +502,38 @@ def generate_report(results_dir='results/exp2', out=None,
     <tr><th>γ</th><th>Best W_net</th><th>Beats Exp0 baseline?</th></tr>
     {rows}
   </table>
-</div>
+</div>''')}
 
-<h2>3. Learning Curves</h2>
-<p class="caption">W_net (best per generation) for each γ value. Hover to inspect values; click legend to toggle runs. Dashed red line is the Exp0 fixed-J ceiling.</p>
-<div class="card">{interactive_curves_html}</div>
+{_collapsible('3. Learning Curves',
+    '<p class="caption">W_net (best per generation) for each γ value. Hover to inspect values; click legend to toggle runs. Dashed red line is the Exp0 fixed-J ceiling.</p>'
+    + f'<div class="card">{interactive_curves_html}</div>')}
 
-<h2>4. W_net vs γ</h2>
-<p class="caption">Best W_net achieved for each γ. The green bar marks the optimal γ*.</p>
-{pdiv('gamma_sweep')}
+{_collapsible('4. W_net vs γ',
+    '<p class="caption">Best W_net achieved for each γ. The green bar marks the optimal γ*.</p>'
+    + pdiv('gamma_sweep'))}
 
-<h2>5. Tau Sensitivity at γ* = {best_gamma:.2f}</h2>
-<p class="caption">Best W_net vs oscillation period τ at the best γ* = {best_gamma:.2f}.</p>
-{pdiv('tau_sweep')}
+{_collapsible(f'5. Tau Sensitivity at γ* = {best_gamma:.2f}',
+    f'<p class="caption">Best W_net vs oscillation period τ at the best γ* = {best_gamma:.2f}.</p>'
+    + pdiv('tau_sweep'))}
 
-<h2>6. Controller Strategy Analysis</h2>
+{_collapsible('6. Controller Strategy Analysis', f'''
 <div class="card">
   <p>The controller MLP maps local state (T_norm, m̄, s_i·s_j, (s_i·s_j)·m̄, budget_norm) → δJ.
   By sweeping (T_norm, m̄) at fixed budget and bond alignment, we can read off the thermodynamic
   strategy the controller has learned without re-running the simulation.</p>
 </div>
-{img('strategy', 'Heatmap of proposed δJ as a function of normalised temperature T_norm (x-axis) and local magnetisation EMA m̄ (y-axis). Left: aligned bonds (s_i·s_j = +1). Right: anti-aligned bonds. Blue = strengthen coupling, red = weaken it. A rational strategy would strengthen bonds during the hot phase when domain walls form, and weaken during the cold phase.')}
+{img("strategy", "Heatmap of proposed δJ as a function of normalised temperature T_norm (x-axis) and local magnetisation EMA m̄ (y-axis). Left: aligned bonds (s_i·s_j = +1). Right: anti-aligned bonds. Blue = strengthen coupling, red = weaken it. A rational strategy would strengthen bonds during the hot phase when domain walls form, and weaken during the cold phase.")}''')}
 
-<h2>7. Connectivity Analysis</h2>
-{img('j_spatial', 'Left: spatial map of time-averaged coupling strength J per site. Heterogeneous patterns indicate the controller has learned spatially structured strategies rather than uniform rescaling. Right: distribution of final J values; markers indicate J_init (grey) and J_c = T_mean/2.269 (red).')}
+{_collapsible('7. Connectivity Analysis',
+    img('j_spatial', 'Left: spatial map of time-averaged coupling strength J per site. Heterogeneous patterns indicate the controller has learned spatially structured strategies rather than uniform rescaling. Right: distribution of final J values; markers indicate J_init (grey) and J_c = T_mean/2.269 (red).'))}
 
-<h2>8. Per-γ Analysis</h2>
+{_collapsible('8. Per-γ Analysis', f'''
 <div class="card">
   <p>Select a γ value to see its controller strategy heatmap and a short simulation animation.</p>
   {selector_html}
-</div>
+</div>''')}
 
-<h2>9. Configuration</h2>
-{config_html if config_html else '<p class="caption">[config.json not found — re-run exp2 to generate]</p>'}
+{_collapsible('9. Configuration', config_html if config_html else '<p class="caption">[config.json not found — re-run exp2 to generate]</p>')}
 
 </body>
 </html>"""

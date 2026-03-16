@@ -74,7 +74,27 @@ code { background: #edf2f7; padding: 2px 6px; border-radius: 3px;
 .beat-no  { color: #c53030; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5em; margin: 1em 0; }
 @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
+details { margin: 1.5em 0; }
+details > summary {
+    color: #2c5282; font-size: 1.25em; font-weight: 600;
+    border-left: 4px solid #3182ce; padding: .4em .6em;
+    cursor: pointer; list-style: none;
+    display: flex; align-items: center; gap: .5em;
+}
+details > summary::before { content: '▶'; font-size: .75em; transition: transform .15s; }
+details[open] > summary::before { transform: rotate(90deg); }
+details > summary::-webkit-details-marker { display: none; }
 """
+
+
+# ---------------------------------------------------------------------------
+# Collapsible section helper
+# ---------------------------------------------------------------------------
+
+def collapsible_section(title, content_html, open=True):
+    """Wrap content in a collapsible <details> block with an <h2>-styled summary."""
+    open_attr = ' open' if open else ''
+    return f'<details{open_attr}>\n<summary>{title}</summary>\n{content_html}\n</details>\n'
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +609,7 @@ def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run')
         f'<div class="scenario-bar">\n'
         f'  <label for="sc_sel_{scenario_ids[0]}">{title}:</label>\n'
         f'  <select id="sc_sel_{scenario_ids[0]}" '
-        f'onchange="{hide_all};document.getElementById(this.value).style.display=\'block\'">\n'
+        f'onchange="{hide_all};document.getElementById(this.value).style.display=\'block\';window.dispatchEvent(new Event(\'resize\'))">\n'
         f'{options}\n'
         f'  </select>\n'
         f'</div>\n'
@@ -626,7 +646,7 @@ def fig_to_plotly_div(fig, include_plotlyjs='cdn'):
 
 
 def plotly_training_curves(series_data, baseline=None, title='',
-                           xlabel='Generation', ylabel='W_net'):
+                           xlabel='Generation', ylabel='W_net', log_x=False):
     """Build a Plotly training-curve figure.
 
     Parameters
@@ -635,6 +655,8 @@ def plotly_training_curves(series_data, baseline=None, title='',
         Each dict has keys 'label', 'x', 'y', and optionally 'color'.
     baseline : float or None
         Horizontal reference line.
+    log_x : bool
+        If True, use a log scale on the x-axis.
 
     Returns
     -------
@@ -657,13 +679,34 @@ def plotly_training_curves(series_data, baseline=None, title='',
             annotation_text=f'baseline {baseline:.3f}',
             annotation_position='bottom right',
         )
-    fig.update_layout(
+    layout_kw = dict(
         title=title, xaxis_title=xlabel, yaxis_title=ylabel,
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        margin=dict(l=60, r=20, t=60, b=40),
+        legend=dict(
+            orientation='v',
+            yanchor='top', y=1,
+            xanchor='left', x=1.02,
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#cbd5e0', borderwidth=1,
+        ),
+        margin=dict(l=60, r=160, t=80, b=40),
         height=350,
         template='plotly_white',
     )
+    if len(series_data) > 1:
+        layout_kw['updatemenus'] = [{
+            'type': 'buttons', 'direction': 'left',
+            'x': 1.02, 'y': 1.08, 'xanchor': 'left', 'yanchor': 'bottom',
+            'buttons': [
+                {'label': 'All On',  'method': 'restyle', 'args': [{'visible': True}]},
+                {'label': 'All Off', 'method': 'restyle', 'args': [{'visible': 'legendonly'}]},
+            ],
+            'bgcolor': '#edf2f7', 'bordercolor': '#cbd5e0', 'font': {'size': 11},
+        }]
+    fig.update_layout(**layout_kw)
+    if log_x:
+        fig.update_xaxes(type='log')
+    else:
+        fig.update_xaxes(rangemode='tozero')
     return fig
 
 
@@ -730,8 +773,14 @@ def plotly_sigma(series_data, title='CMA-ES σ Convergence'):
     fig.update_layout(
         title=title, xaxis_title='Generation', yaxis_title='σ (log scale)',
         yaxis_type='log',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        margin=dict(l=60, r=20, t=60, b=40),
+        legend=dict(
+            orientation='v',
+            yanchor='top', y=1,
+            xanchor='left', x=1.02,
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#cbd5e0', borderwidth=1,
+        ),
+        margin=dict(l=60, r=160, t=80, b=40),
         height=350,
         template='plotly_white',
     )

@@ -24,10 +24,9 @@ import matplotlib.cm as cm
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
-from report_utils import REPORT_CSS as _CSS  # noqa: E402
+from report_utils import REPORT_CSS as _CSS, collapsible_section as _collapsible  # noqa: E402
 
 _EXPLANATION = """
-<h2>1. About This Experiment</h2>
 <div class="card">
   <h3>Physical Setup</h3>
   <p>Same oscillating bath as previous experiments. The best (λ, α) from Experiment 1 is fixed.
@@ -328,9 +327,9 @@ def generate_report(results_dir='results/exp3', out=None,
 <h1>Experiment 3 — Diffusing Budget</h1>
 <p class="meta">Generated: {ts} · Results: {os.path.abspath(results_dir)}</p>
 
-{_EXPLANATION}
+{_collapsible('1. About This Experiment', _EXPLANATION, open=False)}
 
-<h2>2. Key Results</h2>
+{_collapsible('2. Key Results', f'''
 <div class="card">
   <div class="highlight">
     <strong>Best run:</strong> {best_label} → W_net = {best_W_overall:.2f}
@@ -344,32 +343,32 @@ def generate_report(results_dir='results/exp3', out=None,
     The central prediction is W_net peaks near Λ = 1. The table and plots below
     test whether this scaling law holds across D, τ_μ, and T_mean.
   </div>
-</div>
+</div>''')}
 
-<h2>3. D Sweep Learning Curves</h2>
-{img('d_curves', 'W_net (best-ever and mean, shaded) vs generation for each diffusion coefficient D at fixed τ_μ = 20. Each label includes the corresponding Λ value. The dashed red line is the Exp0 fixed-J ceiling.')}
+{_collapsible('3. D Sweep Learning Curves',
+    img('d_curves', 'W_net (best-ever and mean, shaded) vs generation for each diffusion coefficient D at fixed τ_μ = 20. Each label includes the corresponding Λ value. The dashed red line is the Exp0 fixed-J ceiling.'))}
 
-<h2>4. D Sweep Summary</h2>
-{img('d_bar', 'Best W_net vs D at fixed τ_μ = 20. Each bar is annotated with its Λ value. If the Λ ~ 1 hypothesis holds, the highest bar should be the one with Λ closest to 1.')}
+{_collapsible('4. D Sweep Summary',
+    img('d_bar', 'Best W_net vs D at fixed τ_μ = 20. Each bar is annotated with its Λ value. If the Λ ~ 1 hypothesis holds, the highest bar should be the one with Λ closest to 1.'))}
 
-<h2>5. τ_μ Sweep Learning Curves</h2>
-{img('tau_curves', 'Same as above but varying budget lifetime τ_μ at fixed D = 0.1. Different τ_μ values shift Λ proportionally.')}
+{_collapsible('5. τ_μ Sweep Learning Curves',
+    img('tau_curves', 'Same as above but varying budget lifetime τ_μ at fixed D = 0.1. Different τ_μ values shift Λ proportionally.'))}
 
-<h2>6. τ_μ Sweep Summary</h2>
-{img('tau_bar', 'Best W_net vs τ_μ at fixed D = 0.1, with Λ annotations.')}
+{_collapsible('6. τ_μ Sweep Summary',
+    img('tau_bar', 'Best W_net vs τ_μ at fixed D = 0.1, with Λ annotations.'))}
 
-<h2>7. Master Λ Scaling Plot</h2>
-{img('lambda_plot', 'All runs (D sweep, τ_μ sweep, T_mean sweep) plotted together as W_net vs Λ. Each point is one run; the dashed vertical line marks Λ = 1. Points clustering above the baseline near Λ = 1 confirm the scaling hypothesis.')}
+{_collapsible('7. Master Λ Scaling Plot',
+    img('lambda_plot', 'All runs (D sweep, τ_μ sweep, T_mean sweep) plotted together as W_net vs Λ. Each point is one run; the dashed vertical line marks Λ = 1. Points clustering above the baseline near Λ = 1 confirm the scaling hypothesis.'))}
 
-<h2>8. T_mean / ξ Sweep</h2>
-{img('tmean', 'W_net vs T_mean. Changing T_mean shifts the spin correlation length ξ (annotated), which changes Λ = D·τ_μ/ξ² at fixed D and τ_μ. This sweep independently tests whether the optimal Λ tracks ξ changes as predicted.')}
+{_collapsible('8. T_mean / ξ Sweep',
+    img('tmean', 'W_net vs T_mean. Changing T_mean shifts the spin correlation length ξ (annotated), which changes Λ = D·τ_μ/ξ² at fixed D and τ_μ. This sweep independently tests whether the optimal Λ tracks ξ changes as predicted.'))}
 
-<h2>9. Controller Strategy Analysis</h2>
+{_collapsible('9. Controller Strategy Analysis', f'''
 <div class="card">
   <p>MLP forward pass sampled over (T_norm, m̄) for the best run, revealing the
   thermodynamic strategy learned by the diffusing-budget controller.</p>
 </div>
-{img('strategy', 'Heatmap of δJ vs (T_norm, m̄). With diffusing budget, the controller can integrate information over a spatial range set by √(D·τ_μ); a well-tuned Λ should yield a cleaner, more structured strategy than under- or over-diffused budget.')}
+{img("strategy", "Heatmap of δJ vs (T_norm, m̄). With diffusing budget, the controller can integrate information over a spatial range set by √(D·τ_μ); a well-tuned Λ should yield a cleaner, more structured strategy than under- or over-diffused budget.")}''')}
 
 </body>
 </html>"""

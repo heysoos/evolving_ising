@@ -33,11 +33,11 @@ from report_utils import (  # noqa: E402
     fig_to_plotly_div,
     plotly_training_curves,
     plotly_heatmap,
+    collapsible_section as _collapsible,
 )
 
 
 _EXPLANATION = """
-<h2>1. About This Experiment</h2>
 <div class="card">
   <h3>Physical Setup</h3>
   <p>The 2D Ising model sits in a spatially uniform, time-oscillating heat bath:
@@ -236,20 +236,7 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
 
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Experiment 0 — Baseline: Fixed-Coupling Sweep</title>
-  <style>{_CSS}</style>
-</head>
-<body>
-<h1>Experiment 0 — Baseline: Fixed-Coupling Sweep</h1>
-<p class="meta">Generated: {ts} · Results: {os.path.abspath(results_dir)}</p>
-
-{_EXPLANATION}
-
-<h2>2. Key Results</h2>
+    key_results_body = f"""
 <div class="card">
   <div class="highlight">
     <strong>Optimum found:</strong>
@@ -267,32 +254,53 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
     <strong>Baseline ceiling:</strong> W_net = {W_opt:.4f}. An adaptive controller
     must exceed this to demonstrate genuine thermodynamic advantage.
   </div>
-</div>
+</div>"""
 
-<h2>3. W_net Heatmap</h2>
+    heatmap_body = f"""
 <p class="caption">Net extracted work W_net across the J₀ × log₁₀(τ) parameter grid. Hover to inspect values. White dashed line marks J_c = T_mean/2.269.</p>
-<div class="card">{heatmap_div}</div>
+<div class="card">{heatmap_div}</div>"""
 
-<h2>4. Interactive Slices</h2>
+    slices_body = f"""
 <div class="card">
   <p>Hover over either chart to read exact W_net values. The left chart holds τ fixed at its optimum; the right holds J₀ fixed.</p>
   <div style="display:flex;flex-wrap:wrap;gap:1.5em;align-items:flex-start;">
     <div>{j0_chart_html}</div>
     <div>{tau_chart_html}</div>
   </div>
-</div>
+</div>"""
 
-<h2>5. W_net vs Entropy Production</h2>
-{img('scatter', 'Each point is one (J₀, τ) pair. High-work configurations tend to produce moderate entropy — extreme work extraction is always accompanied by some irreversibility.')}
+    scatter_body = img('scatter', 'Each point is one (J₀, τ) pair. High-work configurations tend to produce moderate entropy — extreme work extraction is always accompanied by some irreversibility.')
 
-<h2>6. Spin Dynamics at Optimal Parameters</h2>
+    anim_body = f"""
 <div class="card">
   <p>Fixed-J simulation at J₀ = {J0_opt:.3f}, τ = {tau_opt}. Spin state (left), coupling map (right, constant since J is fixed), and cumulative W_net trace (bottom). Domains form during the cold phase and dissolve during the hot phase — this reversible sponge effect is what the adaptive controller in Experiments 1–3 must improve upon.</p>
   {anim_html if anim_html else '<p class="caption">[Animation not generated — run without --no-animate to include]</p>'}
-</div>
+</div>"""
 
-<h2>7. Configuration</h2>
-{config_html if config_html else '<p class="caption">[config.json not found — re-run exp0_baseline.py to generate]</p>'}
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Experiment 0 — Baseline: Fixed-Coupling Sweep</title>
+  <style>{_CSS}</style>
+</head>
+<body>
+<h1>Experiment 0 — Baseline: Fixed-Coupling Sweep</h1>
+<p class="meta">Generated: {ts} · Results: {os.path.abspath(results_dir)}</p>
+
+{_collapsible('1. About This Experiment', _EXPLANATION, open=False)}
+
+{_collapsible('2. Key Results', key_results_body)}
+
+{_collapsible('3. W_net Heatmap', heatmap_body)}
+
+{_collapsible('4. Interactive Slices', slices_body)}
+
+{_collapsible('5. W_net vs Entropy Production', scatter_body)}
+
+{_collapsible('6. Spin Dynamics at Optimal Parameters', anim_body)}
+
+{_collapsible('7. Configuration', config_html if config_html else '<p class="caption">[config.json not found — re-run exp0_baseline.py to generate]</p>')}
 
 </body>
 </html>"""

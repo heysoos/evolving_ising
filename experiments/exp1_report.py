@@ -41,6 +41,7 @@ from report_utils import (  # noqa: E402
     plotly_training_curves,
     plotly_heatmap,
     plotly_sigma,
+    collapsible_section,
 )
 
 
@@ -141,6 +142,7 @@ def fig_wnet_vs_lambda(runs, baseline_W):
         series, baseline=baseline_W,
         title='W_net vs Lambda by Alpha',
         xlabel='Lambda (λ)', ylabel='Best W_net (final gen)',
+        log_x=True,
     )
 
 
@@ -570,8 +572,6 @@ def fig_J_phase_portrait(J_bar_trace, T_trace):
 # ---------------------------------------------------------------------------
 
 _EXPLANATION = """
-<h2>1. About This Experiment</h2>
-
 <div class="card">
 <h3>Physical Setup</h3>
 <p>
@@ -649,9 +649,9 @@ engine operating between hot and cold phases of a single oscillating bath.
 <div class="card">
 <h3>Controller Architecture</h3>
 <p>
-The controller is a compact <strong>5 → 8 → 8 → 1 MLP</strong>
+The controller is a compact <strong>6 → 8 → 8 → 1 MLP</strong>
 (tanh activations, tanh-scaled output) evaluated <em>independently for each bond</em>
-at each time step.  The five inputs encode the local physical state:
+at each time step.  The six inputs encode the local physical state:
 </p>
 <ul>
   <li><strong>s<sub>i</sub></strong> — spin at site i ∈ {−1, +1}: tells the controller
@@ -667,6 +667,10 @@ at each time step.  The five inputs encode the local physical state:
   <li><strong>b<sub>norm</sub></strong> = tanh(B<sub>ij</sub> / B<sub>scale</sub>) ∈ [0, 1) —
       normalised remaining budget for bond (i, j): tells the controller whether it has
       "credits" to spend on remodelling this bond.</li>
+  <li><strong>J_norm_ij</strong> = tanh(J<sub>ij</sub>/J<sub>c</sub> − 1) — normalised
+      current coupling strength, where J<sub>c</sub> = T<sub>mean</sub>/2.269 is the
+      critical coupling.  Tells the controller how far the bond is from the phase
+      transition, enabling adaptive responses near criticality.</li>
 </ul>
 <p>
 The output δJ ∈ [−δJ<sub>max</sub>, +δJ<sub>max</sub>] is added to the current
@@ -708,7 +712,7 @@ has been deposited in the budget.
 <div class="card">
 <h3>CMA-ES Optimisation</h3>
 <p>
-The MLP weights (185 parameters for 5→8→8→1) are evolved by
+The MLP weights (137 parameters for 6→8→8→1) are evolved by
 <strong>Separable CMA-ES</strong> (diagonal covariance, population size 20).
 Each fitness evaluation runs <em>n_eval_cycles = 10</em> complete temperature cycles
 and returns the mean W<sub>net</sub>.  Fitness is <strong>maximised</strong>.
@@ -853,37 +857,10 @@ def generate_report(results_dir, baseline_path=None, animate=True):
         if f:
             figs['ctrl_budget'] = _fig_to_b64_util(f)
 
-    # Connectivity/J analysis (requires JAX simulation)
-    j_sim = None
-    if best_run_dir is not None:
-        print('  [info] simulating final J state (this may take a moment)...',
-              file=sys.stderr)
-        j_sim = _simulate_final_J(best_run_dir, best_config, n_cycles=5)
-
-    if j_sim is not None:
-        J_final = j_sim['J_final']
-        J_bar   = j_sim['J_bar_trace']
-        T_tr    = j_sim['T_trace']
-        L       = best_config['L']
-        J_init  = best_config['J_init']
-        T_mean  = best_config['T_mean']
-
-        f = fig_J_spatial(J_final, L, J_init, T_mean)
-        if f:
-            figs['J_spatial'] = _fig_to_b64_util(f)
-
-        f = fig_J_histogram(J_final, J_init, T_mean)
-        if f:
-            figs['J_hist'] = _fig_to_b64_util(f)
-
-        f = fig_J_phase_portrait(J_bar, T_tr)
-        if f:
-            figs['J_portrait'] = _fig_to_b64_util(f)
-
     # (interactive curves now provided by plotly_divs['learning_curves'] above)
     interactive_curves_html = plotly_divs.get('learning_curves', '')
 
-    # --- Per-run scenario selector panels ---
+    # --- Per-run J simulations (for connectivity figures in each panel) ---
     model_shared = None
     try:
         from evolving_ising.model import IsingModel
@@ -895,6 +872,16 @@ def generate_report(results_dir, baseline_path=None, animate=True):
     except Exception as _e:
         print(f'  [warn] could not build IsingModel for animations: {_e}', file=sys.stderr)
 
+    j_sims = {}
+    for (lam, alpha) in sorted(runs):
+        run_dir = run_dirs.get((lam, alpha))
+        if run_dir is None:
+            continue
+        run_config = {**best_config, 'lambda': lam, 'budget_alpha': alpha}
+        print(f'  [info] simulating J state for λ={lam:.2f} α={alpha:.2f}...', file=sys.stderr)
+        j_sims[(lam, alpha)] = _simulate_final_J(run_dir, run_config, n_cycles=5)
+
+    # --- Per-run scenario selector panels ---
     scenario_ids = []
     scenario_labels = []
     scenario_panels = {}
@@ -935,25 +922,51 @@ def generate_report(results_dir, baseline_path=None, animate=True):
             except Exception as _e:
                 print(f'  [warn] strategy fig {label}: {_e}', file=sys.stderr)
 
-            if model_shared is not None and animate:
-                try:
-                    print(f'  [info] animating {label}...', file=sys.stderr)
-                    sf, jf, _, wt, tt, bf = run_anim_frames(
-                        model_shared, run_config, 'bond',
-                        params_flat=ctrl_data['params'],
-                        n_cycles=10, steps_per_cycle=80, frame_skip=4,
-                    )
-                    gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
-                                                wnet_trace=wt, T_trace=tt,
-                                                bud_frames=bf)
-                    if gif_b64:
-                        panel += _gif_tag(gif_b64, 'Simulation animation',
-                                          caption='Spin state (left), mean J (centre), per-site budget (right), '
-                                                  'cumulative W_net and bath temperature T(t) below, '
-                                                  'over 10 cycles. '
-                                                  'J structure emerges as the controller adapts bonds to the oscillating bath.')
-                except Exception as _e:
-                    print(f'  [warn] animation {label}: {_e}', file=sys.stderr)
+        # --- Connectivity figures for this run ---
+        run_j_sim = j_sims.get((lam, alpha))
+        if run_j_sim is not None:
+            L_r    = run_config['L']
+            J_init_r = run_config['J_init']
+            T_mean_r = run_config['T_mean']
+            J_final  = run_j_sim['J_final']
+            J_bar    = run_j_sim['J_bar_trace']
+            T_tr     = run_j_sim['T_trace']
+
+            f = fig_J_spatial(J_final, L_r, J_init_r, T_mean_r)
+            if f:
+                panel += _img_tag(_fig_to_b64_util(f), 'J spatial map',
+                                   caption='Left: mean coupling per site after simulation. '
+                                           'Red dashed = J_c. Right: row slices of J map.')
+            f = fig_J_histogram(J_final, J_init_r, T_mean_r)
+            if f:
+                panel += _img_tag(_fig_to_b64_util(f), 'J histogram',
+                                   caption='Distribution of final coupling strengths. '
+                                           'Gray dashed = J_init; red dashed = J_c.')
+            f = fig_J_phase_portrait(J_bar, T_tr)
+            if f:
+                panel += _img_tag(_fig_to_b64_util(f), 'J-T phase portrait',
+                                   caption='J̄ vs T over simulated cycles. '
+                                           'Counter-clockwise loop = productive engine cycle.')
+
+        if ctrl_data is not None and model_shared is not None and animate:
+            try:
+                print(f'  [info] animating {label}...', file=sys.stderr)
+                sf, jf, _, wt, tt, bf = run_anim_frames(
+                    model_shared, run_config, 'bond',
+                    params_flat=ctrl_data['params'],
+                    n_cycles=10, steps_per_cycle=80, frame_skip=4,
+                )
+                gif_b64 = frames_to_gif_b64(sf, jf, fps=8, max_frames=200,
+                                            wnet_trace=wt, T_trace=tt,
+                                            bud_frames=bf)
+                if gif_b64:
+                    panel += _gif_tag(gif_b64, 'Simulation animation',
+                                      caption='Spin state (left), mean J (centre), per-site budget (right), '
+                                              'cumulative W_net and bath temperature T(t) below, '
+                                              'over 10 cycles. '
+                                              'J structure emerges as the controller adapts bonds to the oscillating bath.')
+            except Exception as _e:
+                print(f'  [warn] animation {label}: {_e}', file=sys.stderr)
 
         panel += '</div>\n'
         scenario_panels[sid] = panel
@@ -990,9 +1003,7 @@ def generate_report(results_dir, baseline_path=None, animate=True):
         baseline_extra += f'<li><strong>Baseline optimal τ:</strong> {baseline_tau:.0f}</li>'
 
     key_results_html = f"""
-<h2>2. Key Results</h2>
 <div class="card highlight">
-  <h3>Key Results</h3>
   <ul>
     <li><strong>Best run:</strong> λ = {best_lam:.2f}, α = {best_alpha:.2f}</li>
     <li><strong>Best W_net:</strong> {best_W:.4f}{improvement_str}</li>
@@ -1035,7 +1046,6 @@ def generate_report(results_dir, baseline_path=None, animate=True):
         )
 
     table_html = f"""
-<h2>8. All Runs Summary</h2>
 <table>
   <thead>
     <tr>
@@ -1062,11 +1072,10 @@ def generate_report(results_dir, baseline_path=None, animate=True):
     def _caption(text):
         return f'<div class="caption">{text}</div>'
 
-    # --- Assemble controller strategy section ---
-    ctrl_section = ''
+    # --- Controller strategy section (best run only, for §6) ---
+    ctrl_section_body = ''
     if 'ctrl_strategy' in figs or 'ctrl_budget' in figs:
-        ctrl_section = '''
-<h2>6. Controller Strategy Analysis</h2>
+        ctrl_section_body = '''
 <div class="card">
 <p>
 The panels below probe how the best-evolved controller responds to its inputs
@@ -1077,8 +1086,8 @@ lower J when hot) or whether it has converged to a degenerate or suboptimal poli
 </div>
 '''
         if 'ctrl_strategy' in figs:
-            ctrl_section += _img('ctrl_strategy', 'Controller δJ heatmap')
-            ctrl_section += _caption(
+            ctrl_section_body += _img('ctrl_strategy', 'Controller δJ heatmap')
+            ctrl_section_body += _caption(
                 'δJ as a function of normalised temperature (x-axis, cold left → hot right) '
                 'and local magnetisation EMA m̄ (y-axis) for aligned bonds (left panel, '
                 's<sub>i</sub>·s<sub>j</sub>=+1) and anti-aligned bonds (right, −1), with '
@@ -1090,8 +1099,8 @@ lower J when hot) or whether it has converged to a degenerate or suboptimal poli
                 'Deviations indicate the learned strategy and its alignment with theory.'
             )
         if 'ctrl_budget' in figs:
-            ctrl_section += _img('ctrl_budget', 'Controller budget sensitivity')
-            ctrl_section += _caption(
+            ctrl_section_body += _img('ctrl_budget', 'Controller budget sensitivity')
+            ctrl_section_body += _caption(
                 'Proposed δJ as a function of the remaining budget (x-axis, 0 = empty, '
                 '1 = full) for four conditions: cold vs hot bath × aligned vs anti-aligned '
                 'bond (m̄ = 0 fixed).  '
@@ -1101,53 +1110,16 @@ lower J when hot) or whether it has converged to a degenerate or suboptimal poli
                 'or has not learned to leverage available credits.'
             )
 
-    # --- Assemble connectivity section ---
-    j_section = ''
-    if j_sim is not None and ('J_spatial' in figs or 'J_hist' in figs or 'J_portrait' in figs):
-        j_section = '''
-<h2>7. Connectivity Analysis</h2>
-<div class="card">
-<p>
-After evolving the controller, we run a short simulation (5 cycles) starting
-from the uniform initial coupling J<sub>init</sub> and record the final coupling
-landscape, its histogram, and the J̄–T phase portrait of the last cycle.
-</p>
-</div>
-'''
-        if 'J_spatial' in figs:
-            j_section += _img('J_spatial', 'Spatial J map')
-            j_section += _caption(
-                'Left: mean coupling per lattice site after simulation.  '
-                'Red dashed marker on the colorbar indicates the theoretical critical coupling '
-                'J<sub>c</sub> = T<sub>mean</sub>/2.269.  Sites with J &gt; J<sub>c</sub> '
-                'are biased toward ordered behaviour; sites below it toward disordered.  '
-                'Spatial patterns (striping, boundary effects) indicate non-trivial '
-                'controller strategies.  '
-                'Right: row slices showing heterogeneity across the lattice.'
-            )
-        if 'J_hist' in figs:
-            j_section += _img('J_hist', 'J histogram')
-            j_section += _caption(
-                'Histogram of all valid bond couplings after simulation.  '
-                'A bimodal distribution (peaks below and above J<sub>c</sub>) suggests '
-                'the controller is specialising bonds for different roles.  '
-                'A shift upward from J<sub>init</sub> (gray dashed) means the controller '
-                'is on net strengthening bonds — consistent with a predominantly cold-phase '
-                'ordering strategy.'
-            )
-        if 'J_portrait' in figs:
-            j_section += _img('J_portrait', 'J-T phase portrait')
-            j_section += _caption(
-                'Parametric plot of mean coupling J̄ vs bath temperature T over the last '
-                'simulation cycle.  A <em>counter-clockwise</em> loop (J rises as T falls, '
-                'J falls as T rises) is the signature of a thermodynamically productive '
-                'engine cycle — the controller is correctly pacing its remodelling.  '
-                'A clockwise loop indicates lag or the wrong phase relationship.  '
-                'A near-circular closed loop with good coverage of the T range is ideal.'
-            )
-
     def _pdiv(key):
         return f'<div class="card">{plotly_divs.get(key, "")}</div>' if plotly_divs.get(key) else ''
+
+    # Build per-run section with selector
+    per_run_body = f'''<div class="card">
+  <p>Select a run from the dropdown to see its controller strategy heatmap,
+     connectivity analysis (J spatial map, histogram, phase portrait),
+     and a short simulation animation (spins + J coupling map).</p>
+  {selector_html}
+</div>'''
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1164,58 +1136,34 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
   results from <code>{results_dir}</code>
 </p>
 
-{_EXPLANATION}
+{collapsible_section('1. About This Experiment', _EXPLANATION, open=False)}
 
-{key_results_html}
+{collapsible_section('2. Key Results', key_results_html)}
 
-<h2>3. Learning Curves</h2>
-<p class="caption">Best W_net per generation for each (λ, α) run. Hover to inspect values; click legend to toggle runs. The crimson dashed line marks the exp0 baseline ceiling.</p>
-{_pdiv('learning_curves')}
+{collapsible_section('3. Learning Curves',
+    '<p class="caption">Best W_net per generation for each (λ, α) run. Hover to inspect values; click legend to toggle runs. The crimson dashed line marks the exp0 baseline ceiling.</p>'
+    + _pdiv('learning_curves'))}
 
-<h2>4. Performance Grid</h2>
-<div class="two-col">
-  <div>
-    {_pdiv('heatmap')}
-    {_caption(
-        'Heatmap of final W_net across the (λ, α) grid.  '
-        'Green = high W_net; red = low.  '
-        'The bottom-left corner (low λ, low α) should be warmest if the '
-        'budget constraint is the binding limitation.'
-    )}
-  </div>
-  <div>
-    {_pdiv('wnet_vs_lambda')}
-    {_caption(
-        'W_net as a function of λ for each α value.  '
-        'Monotone decrease with λ validates that the basal penalty is '
-        'the dominant cost.'
-    )}
-  </div>
-</div>
+{collapsible_section('4. Performance Grid',
+    '<div class="two-col">'
+    + '<div>' + _pdiv('heatmap')
+    + _caption('Heatmap of final W_net across the (λ, α) grid. Green = high W_net; red = low. The bottom-left corner (low λ, low α) should be warmest if the budget constraint is the binding limitation.')
+    + '</div>'
+    + '<div>' + _pdiv('wnet_vs_lambda')
+    + _caption('W_net as a function of λ (log scale) for each α value. Monotone decrease with λ validates that the basal penalty is the dominant cost.')
+    + '</div></div>')}
 
-<h2>5. Convergence</h2>
-{_pdiv('sigma')}
-{_caption(
-    'CMA-ES step-size σ on a log scale for all runs.  '
-    'Healthy convergence: σ falls monotonically from its initial value and '
-    'plateaus at a small value (&lt;10⁻³) where the optimizer has narrowed '
-    'to a local optimum.'
-)}
+{collapsible_section('5. Convergence',
+    _pdiv('sigma')
+    + _caption('CMA-ES step-size σ on a log scale for all runs. Healthy convergence: σ falls monotonically from its initial value and plateaus at a small value (&lt;10⁻³) where the optimizer has narrowed to a local optimum.'))}
 
-{ctrl_section}
+{collapsible_section('6. Controller Strategy — Best Run', ctrl_section_body) if ctrl_section_body else ''}
 
-{j_section}
+{collapsible_section('7. Controller Strategy &amp; Connectivity — Per Run', per_run_body)}
 
-{table_html}
+{collapsible_section('8. All Runs Summary', table_html)}
 
-{config_html}
-
-<h2>9. Per-Run Analysis</h2>
-<div class="card">
-  <p>Select a run from the dropdown to see its controller strategy heatmap
-     and a short simulation animation (spins + J coupling map).</p>
-  {selector_html}
-</div>
+{collapsible_section('9. Configuration', config_html) if config_html else ''}
 
 </body>
 </html>
