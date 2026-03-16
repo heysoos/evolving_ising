@@ -83,7 +83,7 @@ def estimate_correlation_length(model, J0, T, n_samples=200):
 
 
 def run_exp3(best_lambda=0.01, best_alpha=0.1, config=None,
-             results_dir='results/exp3', n_generations=500):
+             results_dir='results/exp3', n_generations=500, resume=False):
     """Run Experiment 3: Diffusing Budget sweeps."""
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
@@ -128,10 +128,21 @@ def run_exp3(best_lambda=0.01, best_alpha=0.1, config=None,
             budget_type='diffusing',
             name=name,
             results_dir=results_dir,
+            resume=resume,
         )
         result.extra['xi'] = xi
         result.extra['Lambda'] = Lambda
         results[('D', D)] = result
+
+        try:
+            import os as _os, sys as _sys
+            _HERE = _os.path.dirname(_os.path.abspath(__file__))
+            if _HERE not in _sys.path:
+                _sys.path.insert(0, _HERE)
+            from report_utils import generate_training_report
+            generate_training_report(results_dir)
+        except Exception:
+            pass
 
     # tau_mu sweep at fixed D=0.1
     D_fixed = 0.1
@@ -159,10 +170,21 @@ def run_exp3(best_lambda=0.01, best_alpha=0.1, config=None,
             budget_type='diffusing',
             name=name,
             results_dir=results_dir,
+            resume=resume,
         )
         result.extra['xi'] = xi
         result.extra['Lambda'] = Lambda
         results[('tau_mu', tau_mu)] = result
+
+        try:
+            import os as _os, sys as _sys
+            _HERE = _os.path.dirname(_os.path.abspath(__file__))
+            if _HERE not in _sys.path:
+                _sys.path.insert(0, _HERE)
+            from report_utils import generate_training_report
+            generate_training_report(results_dir)
+        except Exception:
+            pass
 
     # T_mean sweep to vary xi
     T_mean_values = [2.0, 2.5, 3.0]
@@ -195,13 +217,34 @@ def run_exp3(best_lambda=0.01, best_alpha=0.1, config=None,
             budget_type='diffusing',
             name=name,
             results_dir=results_dir,
+            resume=resume,
         )
         result.extra['xi'] = xi_t
         result.extra['Lambda'] = Lambda
         results[('T_mean', T_m)] = result
 
+        try:
+            import os as _os, sys as _sys
+            _HERE = _os.path.dirname(_os.path.abspath(__file__))
+            if _HERE not in _sys.path:
+                _sys.path.insert(0, _HERE)
+            from report_utils import generate_training_report
+            generate_training_report(results_dir)
+        except Exception:
+            pass
+
     return results
 
 
 if __name__ == '__main__':
-    run_exp3()
+    import argparse
+    p = argparse.ArgumentParser(description='Experiment 3: Diffusing Budget sweep')
+    p.add_argument('--results-dir', default='results/exp3')
+    p.add_argument('--n-generations', type=int, default=500)
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--auto-report', action='store_true')
+    p.add_argument('--no-animate', action='store_true')
+    args = p.parse_args()
+
+    run_exp3(results_dir=args.results_dir, n_generations=args.n_generations,
+             resume=args.resume)

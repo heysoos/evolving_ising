@@ -723,6 +723,7 @@ def canvas_chart_html(series_data, canvas_id, title='', xlabel='Generation', yla
 # ---------------------------------------------------------------------------
 
 def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run'):
+    # kept for backward compatibility — use plotly_training_curves + fig_to_plotly_div for new reports
     """Return a dropdown widget that shows/hides scenario panel divs.
 
     The content divs must be written separately by the caller, with
@@ -745,3 +746,259 @@ def scenario_selector_html(scenario_ids, labels, default_id, title='Select Run')
         f'  </select>\n'
         f'</div>\n'
     )
+
+
+# ---------------------------------------------------------------------------
+# Plotly helpers
+# ---------------------------------------------------------------------------
+
+try:
+    import plotly.graph_objects as _go
+    HAS_PLOTLY = True
+except ImportError:
+    _go = None
+    HAS_PLOTLY = False
+
+
+def fig_to_plotly_div(fig, include_plotlyjs='cdn'):
+    """Convert a Plotly Figure to an HTML div string for embedding.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+    include_plotlyjs : str or bool
+        'cdn'  — adds a CDN <script> tag (~10 KB stub)
+        True   — embeds full plotly.js (~3 MB, fully offline)
+        False  — omit (assume plotly.js already included earlier on the page)
+    """
+    if not HAS_PLOTLY or fig is None:
+        return ''
+    return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs,
+                       config={'responsive': True})
+
+
+def plotly_training_curves(series_data, baseline=None, title='',
+                           xlabel='Generation', ylabel='W_net'):
+    """Build a Plotly training-curve figure.
+
+    Parameters
+    ----------
+    series_data : list of dicts
+        Each dict has keys 'label', 'x', 'y', and optionally 'color'.
+        Same format accepted by canvas_chart_html.
+    baseline : float or None
+        Horizontal reference line.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or not series_data:
+        return None
+    fig = _go.Figure()
+    for s in series_data:
+        kw = dict(
+            name=s['label'], x=s['x'], y=s['y'], mode='lines',
+            hovertemplate='gen %{x}<br>' + s['label'] + ': %{y:.3f}<extra></extra>',
+        )
+        if 'color' in s:
+            kw['line'] = dict(color=s['color'])
+        fig.add_trace(_go.Scatter(**kw))
+    if baseline is not None:
+        fig.add_hline(
+            y=baseline, line_dash='dash', line_color='crimson',
+            annotation_text=f'baseline {baseline:.3f}',
+            annotation_position='bottom right',
+        )
+    fig.update_layout(
+        title=title, xaxis_title=xlabel, yaxis_title=ylabel,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=60, r=20, t=60, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    return fig
+
+
+def plotly_heatmap(grid_data, x_labels, y_labels, title='',
+                   x_title='', y_title='', colorscale='RdYlGn'):
+    """Build a Plotly heatmap with hover labels.
+
+    Parameters
+    ----------
+    grid_data : 2D array (rows = y_labels, cols = x_labels)
+    x_labels, y_labels : list of str
+    colorscale : str   Plotly colorscale name
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or grid_data is None:
+        return None
+    arr = np.array(grid_data, dtype=float)
+    text = [[f'{arr[r, c]:.3f}' if not np.isnan(arr[r, c]) else 'N/A'
+             for c in range(arr.shape[1])]
+            for r in range(arr.shape[0])]
+    fig = _go.Figure(_go.Heatmap(
+        z=arr.tolist(),
+        x=[str(xl) for xl in x_labels],
+        y=[str(yl) for yl in y_labels],
+        colorscale=colorscale,
+        text=text, texttemplate='%{text}',
+        hovertemplate='x=%{x}<br>y=%{y}<br>value=%{z:.3f}<extra></extra>',
+        showscale=True,
+    ))
+    fig.update_layout(
+        title=title, xaxis_title=x_title, yaxis_title=y_title,
+        margin=dict(l=60, r=20, t=60, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    return fig
+
+
+def plotly_sigma(series_data, title='CMA-ES σ Convergence'):
+    """Build a Plotly sigma-convergence figure (log y-axis).
+
+    Parameters
+    ----------
+    series_data : list of dicts with 'label', 'x', 'y', optional 'color'
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+    """
+    if not HAS_PLOTLY or not series_data:
+        return None
+    fig = _go.Figure()
+    for s in series_data:
+        kw = dict(
+            name=s['label'], x=s['x'], y=s['y'], mode='lines',
+            hovertemplate='gen %{x}<br>σ=%{y:.4f}<extra></extra>',
+        )
+        if 'color' in s:
+            kw['line'] = dict(color=s['color'])
+        fig.add_trace(_go.Scatter(**kw))
+    fig.update_layout(
+        title=title, xaxis_title='Generation', yaxis_title='σ (log scale)',
+        yaxis_type='log',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=60, r=20, t=60, b=40),
+        height=350,
+        template='plotly_white',
+    )
+    return fig
+
+
+def _write_run_training_report(run_dir, log):
+    """Write a per-run training_report.html with Plotly curves.
+
+    Parameters
+    ----------
+    run_dir : str or Path
+    log : dict with keys 'generation', 'best_fitness', 'mean_fitness', 'sigma'
+    """
+    if not HAS_PLOTLY:
+        return
+    import datetime
+    from pathlib import Path as _Path
+    run_dir = _Path(run_dir)
+    name = run_dir.name
+
+    gens = [int(g) for g in log.get('generation', [])]
+    best = [float(v) for v in log.get('best_fitness', [])]
+    mean = [float(v) for v in log.get('mean_fitness', [])]
+    sigma_vals = [float(v) for v in log.get('sigma', [])]
+
+    series_wnet = [
+        {'label': 'Best W_net', 'x': gens, 'y': best, 'color': '#1f77b4'},
+        {'label': 'Mean W_net', 'x': gens, 'y': mean, 'color': '#ff7f0e'},
+    ]
+    series_sigma = [{'label': 'σ', 'x': gens, 'y': sigma_vals, 'color': '#2ca02c'}]
+
+    fig_curves = plotly_training_curves(series_wnet, title=f'Training — {name}',
+                                        xlabel='Generation', ylabel='W_net')
+    fig_sig = plotly_sigma(series_sigma, title=f'σ Convergence — {name}')
+
+    n_gens = len(gens)
+    best_so_far = max(best) if best else float('nan')
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Training Report — {name}</title>
+  <style>{REPORT_CSS}</style>
+</head>
+<body>
+<h1>Training Report — {name}</h1>
+<p class="meta">Generated: {ts} · Generations completed: {n_gens} · Best W_net: {best_so_far:.4f}</p>
+<h2>Training Curves</h2>
+<div class="card">{fig_to_plotly_div(fig_curves, include_plotlyjs='cdn')}</div>
+<h2>σ Convergence</h2>
+<div class="card">{fig_to_plotly_div(fig_sig, include_plotlyjs=False)}</div>
+</body>
+</html>"""
+
+    (run_dir / 'training_report.html').write_text(html, encoding='utf-8')
+
+
+def generate_training_report(sweep_dir, output_path=None, title=''):
+    """Scan sweep_dir for subdirs with training_log.npz; write training_report.html.
+
+    Parameters
+    ----------
+    sweep_dir : str or Path
+    output_path : str or Path or None
+        Defaults to sweep_dir/training_report.html.
+    title : str
+    """
+    if not HAS_PLOTLY:
+        return
+    import datetime
+    from pathlib import Path as _Path
+    sweep_dir = _Path(sweep_dir)
+    if not sweep_dir.is_dir():
+        return
+
+    series_data = []
+    for sub in sorted(sweep_dir.iterdir()):
+        if not sub.is_dir():
+            continue
+        lp = sub / 'training_log.npz'
+        if not lp.exists():
+            continue
+        try:
+            d = np.load(lp)
+            gens = list(d['generation'].astype(int))
+            best = list(d['best_fitness'].astype(float))
+            color = PALETTE[len(series_data) % len(PALETTE)]
+            series_data.append({'label': sub.name, 'x': gens, 'y': best, 'color': color})
+        except Exception:
+            continue
+
+    if not series_data:
+        return
+
+    report_title = title or f'Training Progress — {sweep_dir.name}'
+    fig = plotly_training_curves(series_data, title=report_title,
+                                 xlabel='Generation', ylabel='Best W_net')
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{report_title}</title>
+  <style>{REPORT_CSS}</style>
+</head>
+<body>
+<h1>{report_title}</h1>
+<p class="meta">Generated: {ts} · Runs: {len(series_data)}</p>
+<div class="card">{fig_to_plotly_div(fig, include_plotlyjs='cdn')}</div>
+</body>
+</html>"""
+
+    out = _Path(output_path) if output_path else sweep_dir / 'training_report.html'
+    out.write_text(html, encoding='utf-8')

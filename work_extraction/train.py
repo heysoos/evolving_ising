@@ -6,6 +6,8 @@ Wires together IsingModel, controller, budget, and WorkExtractionES.
 import os
 import sys
 import json
+import dataclasses
+from pathlib import Path
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -59,9 +61,12 @@ DEFAULT_CONFIG = {
     'num_sweeps': 1,          # Metropolis checkerboard sweeps per step
     'warmup_sweeps': 500,     # sweeps to thermalise spins before evaluation begins
     # --- J pool ---
-    'j_pool_size': 50,        # max J matrices stored in pool (0 = disabled)
+    'j_pool_size': 0,        # max J matrices stored in pool (0 = disabled)
     'j_random_frac': 0.2,     # fraction of chains using fresh random J_init each gen
     'j_pool_elite_frac': 0.3, # fraction of population whose J_final is added to pool
+    # --- Checkpoint / reporting ---
+    'checkpoint_interval': 50,  # save checkpoint + training_log every N gens
+    'report_interval': 50,      # regenerate training_report.html every N gens
     # --- Reproducibility ---
     'seed': 0,                # master seed for JAX PRNG and CMA-ES numpy RNG
 }
@@ -159,8 +164,51 @@ def make_budget(budget_type, model, config):
     return _make_budget_raw(budget_type, neighbors, mask, config)
 
 
+def _save_checkpoint(save_dir, gen, es, pool, log, best_params, master_key):
+    """Save CMA-ES state + accumulated training log to checkpoint.npz."""
+    save_dir = Path(save_dir)
+    state = es.cma.state
+    np.savez(
+        save_dir / 'checkpoint.npz',
+        generation=np.int32(gen),
+        cma_mean=np.asarray(state.mean),
+        cma_sigma=np.asarray(state.sigma),
+        cma_diagC=np.asarray(state.diagC),
+        cma_pc=np.asarray(state.pc),
+        cma_ps=np.asarray(state.ps),
+        cma_rng=np.asarray(state.rng),
+        master_key=np.asarray(master_key),
+        log_generation=np.array(log['generation']),
+        log_best=np.array(log['best_fitness']),
+        log_mean=np.array(log['mean_fitness']),
+        log_sigma=np.array(log['sigma']),
+        best_params=best_params,
+    )
+    # Save JPool state separately
+    if pool.max_size > 0:
+        n = len(pool)
+        matrices = np.stack(pool._matrices) if n > 0 else np.empty((0, pool.N, pool.K), dtype=np.float32)
+        np.savez(
+            save_dir / 'checkpoint_pool.npz',
+            fitnesses=np.array(pool._fitnesses),
+            matrices=matrices,
+        )
+
+
+def _try_write_training_report(save_dir, log):
+    """Write a per-run training_report.html if report_utils is available."""
+    try:
+        _exp_dir = str(Path(__file__).parent.parent / 'experiments')
+        if _exp_dir not in sys.path:
+            sys.path.insert(0, _exp_dir)
+        from report_utils import _write_run_training_report
+        _write_run_training_report(save_dir, log)
+    except Exception:
+        pass
+
+
 def run_experiment(config, budget_type='none', name='experiment',
-                   results_dir='results', verbose=True):
+                   results_dir='results', verbose=True, resume=False):
     """Run a full work extraction experiment.
 
     Parameters
@@ -175,6 +223,9 @@ def run_experiment(config, budget_type='none', name='experiment',
         Directory for saving results.
     verbose : bool
         Print progress.
+    resume : bool
+        If True and a checkpoint exists in save_dir, resume from that checkpoint.
+        If True but no checkpoint exists, start fresh (no rename).
 
     Returns
     -------
@@ -190,37 +241,41 @@ def run_experiment(config, budget_type='none', name='experiment',
         boundary=cfg['boundary'],
     )
 
+    # Determine save directory early (needed for incremental saves and resume)
+    if resume:
+        # Don't auto-rename when resuming — use exact name
+        save_dir = Path(results_dir) / name
+    else:
+        # Auto-rename if directory already exists (original behaviour)
+        save_dir = Path(results_dir) / name
+        if save_dir.exists():
+            suffix = 1
+            while (Path(results_dir) / f'{name}_{suffix}').exists():
+                suffix += 1
+            save_dir = Path(results_dir) / f'{name}_{suffix}'
+            print(f"[train] Directory exists; saving to {save_dir}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     # Build JAX eval function.
-    # j_val is sampled once per chain per generation and shared across all
-    # population members at that chain index, so within-generation fitness
-    # differences reflect controller quality rather than J_init luck.
     n_eval_chains = int(cfg.get('n_eval_chains', 1))
     J_init_lo = float(cfg.get('J_init_lo', cfg['J_init']))
     J_init_hi = float(cfg.get('J_init_hi', cfg['J_init']))
-    # When J_init_lo == J_init_hi (default), each chain gets the same scalar value.
-    # When a range is configured, each random chain draws independently from [lo, hi].
 
     eval_fn_base = make_jax_eval_fn(model, cfg, budget_type)
-    # eval_fn_base: (params_flat, key, J_init_arr) -> (scalar, (N,K))
-    # vmap over population; J_init_arr is broadcast (all members share the same J_init per chain)
     _eval_pop = jax.vmap(eval_fn_base, in_axes=(0, 0, None))
 
     if n_eval_chains > 1:
         def _eval_batch(params_batch, keys_by_chain, J_inits_by_chain):
-            # J_inits_by_chain: (n_chains, N, K) — each chain has its own J_init
             def _one_chain(keys_c, J_init_c):
                 return _eval_pop(params_batch, keys_c, J_init_c)
             w_nets_all, J_finals_all = jax.vmap(_one_chain)(keys_by_chain, J_inits_by_chain)
-            # w_nets_all: (n_chains, pop_size); J_finals_all: (n_chains, pop_size, N, K)
             return jnp.mean(w_nets_all, axis=0), J_finals_all[0]
         eval_batch = jax.jit(_eval_batch)
     else:
         def _eval_batch_single(params_batch, keys, J_init_c):
-            # J_init_c: (N, K) — broadcast to all members
             return _eval_pop(params_batch, keys, J_init_c)
         eval_batch = jax.jit(_eval_batch_single)
 
-    # Determine n_params from controller (same MLP architecture)
     controller = LocalController(
         delta_J_max=cfg['delta_J_max'],
         hidden_size=cfg['hidden_size'],
@@ -242,7 +297,7 @@ def run_experiment(config, budget_type='none', name='experiment',
     j_random_frac = float(cfg.get('j_random_frac', 0.2))
     j_pool_elite_frac = float(cfg.get('j_pool_elite_frac', 0.3))
 
-    # Training loop
+    # Training log buffers
     generations = []
     mean_fitnesses = []
     best_fitnesses = []
@@ -251,19 +306,57 @@ def run_experiment(config, budget_type='none', name='experiment',
     best_ever_fitness = -float('inf')
     best_ever_params = None
 
+    start_gen = 0
     n_gens = cfg['n_generations']
+    ckpt_interval = int(cfg.get('checkpoint_interval', 50))
+    report_interval = int(cfg.get('report_interval', 50))
+
+    # --- Resume: load checkpoint if available ---
+    ckpt_path = save_dir / 'checkpoint.npz'
+    if resume and ckpt_path.exists():
+        try:
+            ckpt = np.load(ckpt_path)
+            start_gen = int(ckpt['generation']) + 1
+            es.cma.state = dataclasses.replace(
+                es.cma.state,
+                mean=jnp.array(ckpt['cma_mean']),
+                sigma=jnp.array(ckpt['cma_sigma']),
+                diagC=jnp.array(ckpt['cma_diagC']),
+                pc=jnp.array(ckpt['cma_pc']),
+                ps=jnp.array(ckpt['cma_ps']),
+                rng=jnp.array(ckpt['cma_rng']),
+            )
+            master_key = jnp.array(ckpt['master_key'])
+            generations = list(ckpt['log_generation'].astype(int))
+            best_fitnesses = list(ckpt['log_best'].astype(float))
+            mean_fitnesses = list(ckpt['log_mean'].astype(float))
+            sigmas = list(ckpt['log_sigma'].astype(float))
+            best_ever_params = ckpt['best_params']
+            best_ever_fitness = float(max(best_fitnesses)) if best_fitnesses else -float('inf')
+            # Restore pool
+            pool_ckpt = save_dir / 'checkpoint_pool.npz'
+            if pool_ckpt.exists():
+                pckpt = np.load(pool_ckpt)
+                n_pool = len(pckpt['fitnesses'])
+                pool._fitnesses = [float(pckpt['fitnesses'][i]) for i in range(n_pool)]
+                pool._matrices = [pckpt['matrices'][i] for i in range(n_pool)] if n_pool > 0 else []
+            print(f"[train] Resumed {name} from gen {start_gen} "
+                  f"(best_ever={best_ever_fitness:.4f})")
+        except Exception as e:
+            print(f"[train] Checkpoint load failed ({e}); starting from scratch.")
+            start_gen = 0
+            generations, best_fitnesses, mean_fitnesses, sigmas = [], [], [], []
+            best_ever_fitness = -float('inf')
+            best_ever_params = None
 
     is_tty = sys.stdout.isatty()
     log_interval = cfg['log_interval']
 
-    pbar = tqdm(range(n_gens), desc=name, unit='gen', disable=not verbose or not is_tty,
-                dynamic_ncols=True)
+    pbar = tqdm(range(start_gen, n_gens), desc=name, unit='gen',
+                disable=not verbose or not is_tty, dynamic_ncols=True)
     for gen in pbar:
         params_list = es.ask()
 
-        # Evaluate entire population in parallel via vmap+jit.
-        # J_init is sampled once per chain (all members in a chain share the same J_init),
-        # so within-generation fitness differences reflect controller quality, not J_init luck.
         params_batch = jnp.array(np.stack(params_list))
         pop_size = cfg['pop_size']
 
@@ -280,11 +373,10 @@ def run_experiment(config, budget_type='none', name='experiment',
         else:
             all_keys = jax.random.split(master_key, 1 + pop_size)
             master_key = all_keys[0]
-            J_init_c = jnp.asarray(J_inits_by_chain_np[0])  # single (N, K)
+            J_init_c = jnp.asarray(J_inits_by_chain_np[0])
             fitnesses_jax, J_finals_jax = eval_batch(params_batch, all_keys[1:], J_init_c)
         fitnesses = list(np.asarray(fitnesses_jax))
 
-        # Update pool with top performers' final J (J_finals_jax shape: (pop_size, N, K))
         pool.update(fitnesses, np.asarray(J_finals_jax), j_pool_elite_frac)
 
         es.tell(params_list, fitnesses)
@@ -302,11 +394,9 @@ def run_experiment(config, budget_type='none', name='experiment',
         best_fitnesses.append(gen_best)
         sigmas.append(float(np.asarray(es.cma.state.sigma)))
 
-        # Tqdm postfix for interactive runs
         pbar.set_postfix(best=f'{best_ever_fitness:.3f}', mean=f'{gen_mean:.3f}',
                          sigma=f'{sigmas[-1]:.4f}')
 
-        # Plain-text periodic print for file-redirected / non-TTY runs
         if verbose and not is_tty and (gen % log_interval == 0 or gen == n_gens - 1):
             print(f"  [{name}] gen {gen:4d}/{n_gens}  "
                   f"best_ever={best_ever_fitness:8.4f}  "
@@ -314,9 +404,34 @@ def run_experiment(config, budget_type='none', name='experiment',
                   f"mean={gen_mean:8.4f}  "
                   f"sigma={sigmas[-1]:.4f}", flush=True)
 
+        # Incremental saves every checkpoint_interval gens
+        if (gen + 1) % ckpt_interval == 0 or gen == n_gens - 1:
+            current_log = {
+                'generation': np.array(generations),
+                'mean_fitness': np.array(mean_fitnesses),
+                'best_fitness': np.array(best_fitnesses),
+                'sigma': np.array(sigmas),
+            }
+            np.savez(save_dir / 'training_log.npz', **current_log)
+            if best_ever_params is not None:
+                np.savez(save_dir / 'best_controller.npz', params=best_ever_params)
+            _save_checkpoint(save_dir, gen, es, pool, current_log,
+                             best_ever_params if best_ever_params is not None else np.zeros(controller.n_params),
+                             master_key)
+
+        # Regenerate per-run training_report.html
+        if (gen + 1) % report_interval == 0 or gen == n_gens - 1:
+            current_log = {
+                'generation': np.array(generations),
+                'mean_fitness': np.array(mean_fitnesses),
+                'best_fitness': np.array(best_fitnesses),
+                'sigma': np.array(sigmas),
+            }
+            _try_write_training_report(save_dir, current_log)
+
     pbar.close()
 
-    # Save results
+    # Final training log
     training_log = {
         'generation': np.array(generations),
         'mean_fitness': np.array(mean_fitnesses),
@@ -331,31 +446,22 @@ def run_experiment(config, budget_type='none', name='experiment',
         best_params=best_ever_params if best_ever_params is not None else es.best_params,
     )
 
-    # Save to disk — auto-rename if directory already exists
-    save_dir = os.path.join(results_dir, name)
-    if os.path.exists(save_dir):
-        suffix = 1
-        while os.path.exists(f"{save_dir}_{suffix}"):
-            suffix += 1
-        save_dir = f"{save_dir}_{suffix}"
-        print(f"[train] Directory exists; saving to {save_dir}")
-    os.makedirs(save_dir, exist_ok=True)
-
-    np.savez(
-        os.path.join(save_dir, 'training_log.npz'),
-        **training_log,
-    )
-    np.savez(
-        os.path.join(save_dir, 'best_controller.npz'),
-        params=result.best_params,
-    )
+    # Save final results
+    np.savez(save_dir / 'training_log.npz', **training_log)
+    np.savez(save_dir / 'best_controller.npz', params=result.best_params)
 
     config_serializable = {
         k: (v.item() if hasattr(v, 'item') else v)
         for k, v in cfg.items()
         if isinstance(v, (int, float, str, bool)) or hasattr(v, 'item')
     }
-    with open(os.path.join(save_dir, 'config.json'), 'w') as _f:
+    with open(save_dir / 'config.json', 'w') as _f:
         json.dump(config_serializable, _f, indent=2)
+
+    # Delete checkpoint files after successful completion
+    for ckpt_file in ('checkpoint.npz', 'checkpoint_pool.npz'):
+        p = save_dir / ckpt_file
+        if p.exists():
+            p.unlink()
 
     return result

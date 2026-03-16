@@ -29,8 +29,10 @@ from report_utils import (  # noqa: E402
     config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
-    canvas_chart_html,
     gif_tag as _gif_tag,
+    fig_to_plotly_div,
+    plotly_training_curves,
+    plotly_heatmap,
 )
 
 
@@ -91,40 +93,27 @@ _EXPLANATION = """
 
 
 def fig_heatmap(results):
+    """W_net heatmap as Plotly div (J0 × log10(tau)); returns div string."""
     W = results['W_net_grid']
-    S = results['sigma_grid']
     J0 = results['J0_values']
     tau = results['tau_values']
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    x_labels = [f'{np.log10(t):.2f}' for t in tau]
+    y_labels = [f'{j:.2f}' for j in J0]
 
-    for ax, data, label, cmap in zip(
-        axes,
-        [W, S],
-        ['W_net', 'Σ_cycle (entropy production)'],
-        ['viridis', 'plasma'],
-    ):
-        im = ax.imshow(
-            data,
-            aspect='auto', origin='lower',
-            extent=[np.log10(tau[0]), np.log10(tau[-1]), J0[0], J0[-1]],
-            cmap=cmap,
-        )
-        plt.colorbar(im, ax=ax, label=label)
-        ax.set_xlabel('log₁₀(τ)')
-        ax.set_ylabel('J₀')
-        ax.set_title(label)
-
-        # Mark optimum
-        best = np.unravel_index(data.argmax(), data.shape)
-        ax.plot(np.log10(tau[best[1]]), J0[best[0]], 'r*', markersize=14,
-                label=f'optimum J₀={J0[best[0]]:.2f}')
-        ax.axhline(2.5 / 2.269, color='white', ls='--', lw=1.4,
-                   label='J_c = T_mean/2.269')
-        ax.legend(fontsize=8)
-
-    fig.tight_layout()
-    return _fig_to_b64(fig)
+    fig = plotly_heatmap(
+        W, x_labels=x_labels, y_labels=y_labels,
+        title='W_net — J₀ × log₁₀(τ) sweep',
+        x_title='log₁₀(τ)', y_title='J₀',
+        colorscale='Viridis',
+    )
+    if fig is not None:
+        # Mark J_c reference line
+        import plotly.graph_objects as _go
+        j_c = 2.5 / 2.269
+        fig.add_hline(y=j_c, line_dash='dash', line_color='white',
+                      annotation_text=f'J_c={j_c:.2f}', annotation_position='top right')
+    return fig_to_plotly_div(fig, include_plotlyjs='cdn') if fig is not None else ''
 
 
 def fig_slices(results):
@@ -191,9 +180,15 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
     err_pct = abs(J0_opt - J_c) / J_c * 100
     pass_cls = 'pass' if err_pct < 25 else ('warn' if err_pct < 50 else 'fail')
 
+    # Plotly heatmap (returns div string)
+    heatmap_div = ''
+    try:
+        heatmap_div = fig_heatmap(results)
+    except Exception as e:
+        print(f'  Warning: heatmap failed: {e}')
+
     figs = {}
     for key, fn, args in [
-        ('heatmap', fig_heatmap, (results,)),
         ('scatter', fig_scatter, (results,)),
     ]:
         try:
@@ -212,35 +207,30 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
             parts.append(f'<p class="caption">{caption}</p>')
         return '\n'.join(parts)
 
-    # --- Interactive canvas charts (J0 slice and tau slice) ---
+    # --- Plotly slice charts (J0 slice and tau slice) ---
     W = results['W_net_grid']
     J0_vals = results['J0_values']
     tau_vals = results['tau_values']
     best_idx = np.unravel_index(W.argmax(), W.shape)
 
-    j0_series = [{
-        'label': f'W_net vs J₀  (τ={int(tau_vals[best_idx[1]])})',
-        'x': [float(v) for v in J0_vals],
-        'y': [float(v) for v in W[:, best_idx[1]]],
-        'color': '#1f77b4',
-    }]
-    tau_series = [{
-        'label': f'W_net vs τ  (J₀={J0_vals[best_idx[0]]:.2f})',
-        'x': [float(v) for v in tau_vals],
-        'y': [float(v) for v in W[best_idx[0], :]],
-        'color': '#ff7f0e',
-    }]
-
-    j0_chart_html = canvas_chart_html(
-        j0_series, 'exp0_j0',
-        title='W_net vs J₀ at optimal τ (hover for exact values)',
-        xlabel='J₀', ylabel='W_net', width=620, height=260,
+    j0_fig = plotly_training_curves(
+        [{'label': f'W_net vs J₀  (τ={int(tau_vals[best_idx[1]])})',
+          'x': [float(v) for v in J0_vals],
+          'y': [float(v) for v in W[:, best_idx[1]]],
+          'color': '#1f77b4'}],
+        title='W_net vs J₀ at optimal τ',
+        xlabel='J₀', ylabel='W_net',
     )
-    tau_chart_html = canvas_chart_html(
-        tau_series, 'exp0_tau',
-        title='W_net vs τ at optimal J₀ (hover for exact values)',
-        xlabel='τ', ylabel='W_net', width=620, height=260,
+    tau_fig = plotly_training_curves(
+        [{'label': f'W_net vs τ  (J₀={J0_vals[best_idx[0]]:.2f})',
+          'x': [float(v) for v in tau_vals],
+          'y': [float(v) for v in W[best_idx[0], :]],
+          'color': '#ff7f0e'}],
+        title='W_net vs τ at optimal J₀',
+        xlabel='τ', ylabel='W_net',
     )
+    j0_chart_html = fig_to_plotly_div(j0_fig, include_plotlyjs='cdn' if not heatmap_div else False)
+    tau_chart_html = fig_to_plotly_div(tau_fig, include_plotlyjs=False)
 
     # --- Spin animation at optimal J0, tau (no controller) ---
     anim_html = ''
@@ -312,8 +302,9 @@ def generate_report(results_dir='results/exp0', out=None, animate=True):
   </div>
 </div>
 
-<h2>3. W_net and Entropy Heatmaps</h2>
-{img('heatmap', 'Left: net extracted work W_net across the J₀ × τ parameter grid. Right: entropy production Σ_cycle. The white dashed line marks J_c = T_mean/2.269; the red star marks the optimum.')}
+<h2>3. W_net Heatmap</h2>
+<p class="caption">Net extracted work W_net across the J₀ × log₁₀(τ) parameter grid. Hover to inspect values. White dashed line marks J_c = T_mean/2.269.</p>
+<div class="card">{heatmap_div}</div>
 
 <h2>4. Interactive Slices</h2>
 <div class="card">

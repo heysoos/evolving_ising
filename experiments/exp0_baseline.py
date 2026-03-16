@@ -21,7 +21,7 @@ from work_extraction.thermodynamics import run_cycles_jax
 from work_extraction.train import DEFAULT_CONFIG
 
 
-def run_baseline_sweep(config=None, results_dir='../results/exp0'):
+def run_baseline_sweep(config=None, results_dir='../results/exp0', resume=False):
     """Run the baseline J0 × tau sweep using JAX vmap + nested lax.scan.
 
     All J0 values are evaluated in parallel via jax.vmap.  A single
@@ -56,6 +56,20 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
 
     W_net_grid = np.zeros((len(J0_values), len(tau_values)))
     sigma_grid  = np.zeros((len(J0_values), len(tau_values)))
+    completed_mask = np.zeros(len(tau_values), dtype=bool)
+
+    # Resume: load partial checkpoint if available
+    _save_dir_for_resume = os.path.join(results_dir, '.') if resume else None
+    _ckpt_path = os.path.join(results_dir, 'checkpoint.npz')
+    if resume and os.path.exists(_ckpt_path):
+        try:
+            _ckpt = np.load(_ckpt_path)
+            W_net_grid = _ckpt['W_net_grid']
+            sigma_grid = _ckpt['sigma_grid']
+            completed_mask = _ckpt['completed_mask'].astype(bool)
+            print(f"[exp0] Resumed: {completed_mask.sum()}/{len(tau_values)} tau values completed")
+        except Exception as _e:
+            print(f"[exp0] Checkpoint load failed ({_e}); starting from scratch.")
 
     # JIT + vmap over J0.  Compiles once for the fixed (n_cycles, num_sweeps)
     # structure.  tau and steps_per_cycle are dynamic JAX arguments so
@@ -81,7 +95,13 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
 
     master_key = jax.random.PRNGKey(42)
 
+    os.makedirs(results_dir, exist_ok=True)
+
     for j, tau in enumerate(tau_values):
+        if completed_mask[j]:
+            print(f"tau={tau:5d}: [skipped — already completed]")
+            continue
+
         master_key, *init_keys = jax.random.split(master_key, len(J0_values) + 1)
         init_keys   = jnp.stack(init_keys)
         spins_batch = jax.vmap(lambda k: model.init_spins(k, batch_size))(init_keys)
@@ -95,12 +115,18 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
 
         W_net_grid[:, j] = np.asarray(W_nets)
         sigma_grid[:, j]  = np.asarray(sigmas)
+        completed_mask[j] = True
 
         best_i = int(np.argmax(W_net_grid[:, j]))
         print(f"tau={tau:5d}: W_net=[{W_net_grid[:,j].min():.3f} … "
               f"{W_net_grid[:,j].max():.3f}]  "
               f"best J0={J0_values[best_i]:.2f} "
               f"(W_net={W_net_grid[best_i,j]:.4f})")
+
+        # Incremental checkpoint after each tau row
+        np.savez(os.path.join(results_dir, 'checkpoint.npz'),
+                 W_net_grid=W_net_grid, sigma_grid=sigma_grid,
+                 completed_mask=completed_mask)
 
     # Find optimum
     best_idx = np.unravel_index(W_net_grid.argmax(), W_net_grid.shape)
@@ -111,14 +137,11 @@ def run_baseline_sweep(config=None, results_dir='../results/exp0'):
     print(f"\nOptimal: J0={J0_opt:.4f}, tau={tau_opt}, W_net={W_net_opt:.4f}")
     print(f"Expected J0_opt ≈ T_mean/2.269 = {T_mean/2.269:.4f}")
 
-    # Save results — auto-rename if directory already exists
-    if os.path.exists(results_dir):
-        suffix = 1
-        while os.path.exists(f"{results_dir}_{suffix}"):
-            suffix += 1
-        results_dir = f"{results_dir}_{suffix}"
-        print(f"[exp0] Directory exists; saving to {results_dir}")
-    os.makedirs(results_dir, exist_ok=True)
+    # Delete checkpoint after successful completion
+    _ckpt_done = os.path.join(results_dir, 'checkpoint.npz')
+    if os.path.exists(_ckpt_done):
+        os.remove(_ckpt_done)
+
     np.savez(
         os.path.join(results_dir, 'sweep.npz'),
         J0_values=J0_values,
@@ -203,5 +226,24 @@ def plot_heatmap(results, figures_dir='figures'):
 
 
 if __name__ == '__main__':
-    results = run_baseline_sweep()
+    import argparse
+    p = argparse.ArgumentParser(description='Experiment 0: Baseline fixed-J sweep')
+    p.add_argument('--results-dir', default='../results/exp0')
+    p.add_argument('--resume', action='store_true',
+                   help='Skip already-completed tau rows')
+    p.add_argument('--auto-report', action='store_true',
+                   help='Run exp0_report.py after sweep completes')
+    p.add_argument('--no-animate', action='store_true',
+                   help='Skip spin animation in auto-report')
+    args = p.parse_args()
+
+    results = run_baseline_sweep(results_dir=args.results_dir, resume=args.resume)
     plot_heatmap(results)
+
+    if args.auto_report:
+        import sys
+        _HERE = os.path.dirname(os.path.abspath(__file__))
+        if _HERE not in sys.path:
+            sys.path.insert(0, _HERE)
+        from exp0_report import generate_report
+        generate_report(args.results_dir, animate=not args.no_animate)

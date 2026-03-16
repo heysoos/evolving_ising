@@ -33,11 +33,14 @@ from report_utils import (  # noqa: E402
     config_table_html,
     run_anim_frames,
     frames_to_gif_b64,
-    canvas_chart_html,
     scenario_selector_html,
     img_tag as _img_tag,
     gif_tag as _gif_tag,
     PALETTE,
+    fig_to_plotly_div,
+    plotly_training_curves,
+    plotly_heatmap,
+    plotly_sigma,
 )
 
 
@@ -67,56 +70,27 @@ def _parse_run_name(name):
 # ---------------------------------------------------------------------------
 
 def fig_learning_curves(runs, baseline_W):
-    """One subplot per lambda, curves per alpha, baseline dashed line."""
-    lam_vals = sorted({lam for lam, _ in runs})
-    n_lam = len(lam_vals)
-    if n_lam == 0:
-        return None
-
-    ncols = min(n_lam, 4)
-    nrows = (n_lam + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows),
-                             squeeze=False)
-    fig.suptitle('Learning Curves — W_net vs Generation', fontsize=13, y=1.01)
-
-    alpha_vals = sorted({alpha for _, alpha in runs})
-    cmap = matplotlib.colormaps['viridis'].resampled(max(len(alpha_vals), 1))
-    alpha_color = {a: cmap(i) for i, a in enumerate(alpha_vals)}
-
-    for ax_idx, lam in enumerate(lam_vals):
-        row, col = divmod(ax_idx, ncols)
-        ax = axes[row][col]
-        ax.set_title(f'λ = {lam:.2f}', fontsize=10)
-        ax.set_xlabel('Generation')
-        ax.set_ylabel('W_net')
-
-        for (l, alpha), data in sorted(runs.items()):
-            if l != lam:
-                continue
-            best_hist = data.get('best_fitness')
-            if best_hist is None:
-                continue
-            gens = np.arange(len(best_hist))
-            ax.plot(gens, best_hist, color=alpha_color[alpha],
-                    label=f'α={alpha:.2f}', linewidth=1.2)
-
-        if baseline_W is not None:
-            ax.axhline(baseline_W, color='crimson', linestyle='--',
-                       linewidth=1.2, label='baseline')
-
-        ax.legend(fontsize=7, loc='lower right')
-
-    # Hide unused subplots
-    for ax_idx in range(n_lam, nrows * ncols):
-        row, col = divmod(ax_idx, ncols)
-        axes[row][col].set_visible(False)
-
-    fig.tight_layout()
-    return fig
+    """All runs as Plotly training curves; returns plotly Figure."""
+    series = []
+    for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
+        best_hist = data.get('best_fitness')
+        if best_hist is None or len(best_hist) == 0:
+            continue
+        series.append({
+            'label': f'λ={lam:.2f} α={alpha:.2f}',
+            'x': list(range(len(best_hist))),
+            'y': [float(v) for v in best_hist],
+            'color': PALETTE[idx % len(PALETTE)],
+        })
+    return plotly_training_curves(
+        series, baseline=baseline_W,
+        title='Learning Curves — Best W_net vs Generation',
+        xlabel='Generation', ylabel='W_net',
+    )
 
 
 def fig_heatmap(runs, baseline_W):
-    """Alpha × lambda heatmap of best W_net; star marks best cell."""
+    """Alpha × lambda heatmap of best W_net; returns plotly Figure."""
     lam_vals = sorted({lam for lam, _ in runs})
     alpha_vals = sorted({alpha for _, alpha in runs})
     if not lam_vals or not alpha_vals:
@@ -130,49 +104,24 @@ def fig_heatmap(runs, baseline_W):
         if best_hist is not None and len(best_hist) > 0:
             grid[r, c] = float(best_hist[-1])
 
-    fig, ax = plt.subplots(figsize=(max(4, len(lam_vals) * 0.9 + 1.5),
-                                    max(3, len(alpha_vals) * 0.8 + 1.2)))
-
-    vmin = np.nanmin(grid) if not np.all(np.isnan(grid)) else 0
-    vmax = np.nanmax(grid) if not np.all(np.isnan(grid)) else 1
-    im = ax.imshow(grid, aspect='auto', origin='lower',
-                   vmin=vmin, vmax=vmax, cmap='RdYlGn')
-    fig.colorbar(im, ax=ax, label='Best W_net (final gen)')
-
-    ax.set_xticks(range(len(lam_vals)))
-    ax.set_xticklabels([f'{v:.2f}' for v in lam_vals], fontsize=8)
-    ax.set_yticks(range(len(alpha_vals)))
-    ax.set_yticklabels([f'{v:.2f}' for v in alpha_vals], fontsize=8)
-    ax.set_xlabel('Lambda (λ)')
-    ax.set_ylabel('Alpha (α)')
-    ax.set_title('Best W_net — Alpha × Lambda Grid', fontsize=11)
-
-    # Mark best cell with a star
-    if not np.all(np.isnan(grid)):
-        best_idx = np.unravel_index(np.nanargmax(grid), grid.shape)
-        ax.plot(best_idx[1], best_idx[0], '*', color='navy',
-                markersize=14, label='best')
-        ax.legend(fontsize=9)
-
-    if baseline_W is not None:
-        fig.text(0.5, -0.04,
-                 f'Baseline W_net = {baseline_W:.4f}  (dashed reference)',
-                 ha='center', fontsize=9, color='crimson')
-
-    fig.tight_layout()
-    return fig
+    return plotly_heatmap(
+        grid,
+        x_labels=[f'{v:.2f}' for v in lam_vals],
+        y_labels=[f'{v:.2f}' for v in alpha_vals],
+        title='Best W_net — Alpha × Lambda Grid',
+        x_title='Lambda (λ)', y_title='Alpha (α)',
+        colorscale='RdYlGn',
+    )
 
 
 def fig_wnet_vs_lambda(runs, baseline_W):
-    """W_net vs lambda, one curve per alpha."""
+    """W_net vs lambda, one curve per alpha; returns plotly Figure."""
     lam_vals = sorted({lam for lam, _ in runs})
     alpha_vals = sorted({alpha for _, alpha in runs})
     if not lam_vals or not alpha_vals:
         return None
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    cmap = matplotlib.colormaps['viridis'].resampled(max(len(alpha_vals), 1))
-
+    series = []
     for i, alpha in enumerate(alpha_vals):
         xs, ys = [], []
         for lam in lam_vals:
@@ -184,41 +133,31 @@ def fig_wnet_vs_lambda(runs, baseline_W):
                 xs.append(lam)
                 ys.append(float(best_hist[-1]))
         if xs:
-            ax.plot(xs, ys, 'o-', color=cmap(i), label=f'α={alpha:.2f}',
-                    linewidth=1.5, markersize=5)
-
-    if baseline_W is not None:
-        ax.axhline(baseline_W, color='crimson', linestyle='--',
-                   linewidth=1.4, label='baseline')
-
-    ax.set_xlabel('Lambda (λ) — thermodynamic cost weight')
-    ax.set_ylabel('Best W_net (final generation)')
-    ax.set_title('W_net vs Lambda by Alpha')
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    return fig
+            series.append({
+                'label': f'α={alpha:.2f}', 'x': xs, 'y': ys,
+                'color': PALETTE[i % len(PALETTE)],
+            })
+    return plotly_training_curves(
+        series, baseline=baseline_W,
+        title='W_net vs Lambda by Alpha',
+        xlabel='Lambda (λ)', ylabel='Best W_net (final gen)',
+    )
 
 
 def fig_sigma_convergence(runs):
-    """CMA-ES sigma on semilogy for all runs."""
-    fig, ax = plt.subplots(figsize=(7, 4))
-    cmap = matplotlib.colormaps['tab20'].resampled(max(len(runs), 1))
-
+    """CMA-ES sigma convergence; returns plotly Figure."""
+    series = []
     for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
         sigma = data.get('sigma')
         if sigma is None or len(sigma) == 0:
             continue
-        label = f'λ={lam:.2f} α={alpha:.2f}'
-        ax.semilogy(np.arange(len(sigma)), sigma,
-                    color=cmap(idx % 20), linewidth=1.0, label=label, alpha=0.75)
-
-    ax.set_xlabel('Generation')
-    ax.set_ylabel('CMA-ES sigma (log scale)')
-    ax.set_title('CMA-ES Sigma Convergence — All Runs')
-    if len(runs) <= 12:
-        ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    return fig
+        series.append({
+            'label': f'λ={lam:.2f} α={alpha:.2f}',
+            'x': list(range(len(sigma))),
+            'y': [float(v) for v in sigma],
+            'color': PALETTE[idx % len(PALETTE)],
+        })
+    return plotly_sigma(series, title='CMA-ES σ Convergence — All Runs')
 
 
 # ---------------------------------------------------------------------------
@@ -884,24 +823,25 @@ def generate_report(results_dir, baseline_path=None, animate=True):
         'neighborhood': 'von_neumann', 'boundary': 'periodic',
     }
 
-    # --- Figures ---
+    # --- Plotly figures (training curves, heatmap, wnet_vs_lambda, sigma) ---
+    plotly_divs = {}
+    _plotlyjs_included = False
+
+    def _plotly(key, fig):
+        nonlocal _plotlyjs_included
+        if fig is None:
+            return
+        js = False if _plotlyjs_included else 'cdn'
+        _plotlyjs_included = True
+        plotly_divs[key] = fig_to_plotly_div(fig, include_plotlyjs=js)
+
+    _plotly('learning_curves', fig_learning_curves(runs, baseline_W))
+    _plotly('heatmap', fig_heatmap(runs, baseline_W))
+    _plotly('wnet_vs_lambda', fig_wnet_vs_lambda(runs, baseline_W))
+    _plotly('sigma', fig_sigma_convergence(runs))
+
+    # --- Static matplotlib figures (spatial analysis) ---
     figs = {}
-
-    f = fig_learning_curves(runs, baseline_W)
-    if f:
-        figs['learning_curves'] = _fig_to_b64_util(f)
-
-    f = fig_heatmap(runs, baseline_W)
-    if f:
-        figs['heatmap'] = _fig_to_b64_util(f)
-
-    f = fig_wnet_vs_lambda(runs, baseline_W)
-    if f:
-        figs['wnet_vs_lambda'] = _fig_to_b64_util(f)
-
-    f = fig_sigma_convergence(runs)
-    if f:
-        figs['sigma'] = _fig_to_b64_util(f)
 
     # Controller strategy (only if we have params)
     if best_params_flat is not None:
@@ -940,24 +880,8 @@ def generate_report(results_dir, baseline_path=None, animate=True):
         if f:
             figs['J_portrait'] = _fig_to_b64_util(f)
 
-    # --- Interactive canvas chart (all training curves) ---
-    chart_series = []
-    for idx, ((lam, alpha), data) in enumerate(sorted(runs.items())):
-        bh = data.get('best_fitness')
-        if bh is None or len(bh) == 0:
-            continue
-        chart_series.append({
-            'label': f'λ={lam:.2f} α={alpha:.2f}',
-            'x': list(range(len(bh))),
-            'y': [float(v) for v in bh],
-            'color': PALETTE[idx % len(PALETTE)],
-        })
-    interactive_curves_html = canvas_chart_html(
-        chart_series, 'exp1_curves',
-        title='Training Curves — W_net vs Generation (hover to inspect, click legend to toggle)',
-        xlabel='Generation', ylabel='W_net',
-        baseline=baseline_W,
-    )
+    # (interactive curves now provided by plotly_divs['learning_curves'] above)
+    interactive_curves_html = plotly_divs.get('learning_curves', '')
 
     # --- Per-run scenario selector panels ---
     model_shared = None
@@ -1222,6 +1146,9 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
                 'A near-circular closed loop with good coverage of the T range is ideal.'
             )
 
+    def _pdiv(key):
+        return f'<div class="card">{plotly_divs.get(key, "")}</div>' if plotly_divs.get(key) else ''
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1242,57 +1169,37 @@ landscape, its histogram, and the J̄–T phase portrait of the last cycle.
 {key_results_html}
 
 <h2>3. Learning Curves</h2>
-{_img('learning_curves', 'Learning Curves (W_net vs Generation)')}
-{_caption(
-    'Best W_net per generation for each (λ, α) run, grouped by λ value.  '
-    'Each curve colour corresponds to a different α.  '
-    'The crimson dashed line marks the exp0 baseline ceiling.  '
-    'Look for: (1) runs that cross the baseline (controller beats fixed J), '
-    '(2) early plateau (converged quickly) vs late improvement (slow landscape), '
-    '(3) whether low λ runs converge faster and higher than high λ runs.'
-)}
-
-<h2>3b. Interactive Training Curves</h2>
-<div class="card">
-  <p>Hover over the chart to inspect values at any generation.
-     Click the coloured buttons to toggle individual runs on or off.</p>
-  {interactive_curves_html}
-</div>
+<p class="caption">Best W_net per generation for each (λ, α) run. Hover to inspect values; click legend to toggle runs. The crimson dashed line marks the exp0 baseline ceiling.</p>
+{_pdiv('learning_curves')}
 
 <h2>4. Performance Grid</h2>
 <div class="two-col">
   <div>
-    {_img('heatmap', 'W_net Heatmap')}
+    {_pdiv('heatmap')}
     {_caption(
         'Heatmap of final W_net across the (λ, α) grid.  '
         'Green = high W_net; red = low.  '
-        'The navy star marks the single best cell.  '
         'The bottom-left corner (low λ, low α) should be warmest if the '
         'budget constraint is the binding limitation.'
     )}
   </div>
   <div>
-    {_img('wnet_vs_lambda', 'W_net vs Lambda')}
+    {_pdiv('wnet_vs_lambda')}
     {_caption(
         'W_net as a function of λ for each α value.  '
         'Monotone decrease with λ validates that the basal penalty is '
-        'the dominant cost.  Non-monotone behaviour at a particular α '
-        'may indicate that moderate cost regularises noisy bond updates '
-        'and improves sample efficiency.'
+        'the dominant cost.'
     )}
   </div>
 </div>
 
 <h2>5. Convergence</h2>
-{_img('sigma', 'CMA-ES Sigma Convergence')}
+{_pdiv('sigma')}
 {_caption(
     'CMA-ES step-size σ on a log scale for all runs.  '
     'Healthy convergence: σ falls monotonically from its initial value and '
     'plateaus at a small value (&lt;10⁻³) where the optimizer has narrowed '
-    'to a local optimum.  '
-    'Runs where σ stagnates at a large value have not converged; '
-    'runs where σ collapses very early may have premature convergence to a '
-    'suboptimal solution.'
+    'to a local optimum.'
 )}
 
 {ctrl_section}
